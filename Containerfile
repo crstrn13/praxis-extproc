@@ -30,6 +30,7 @@ ENV OPENSSL_NO_VENDOR=1
 WORKDIR /build
 COPY . .
 
+
 RUN set -eu; \
     if [ "${CARGO_PROFILE}" = "release" ]; then \
       cargo build --ignore-rust-version --release --bin praxis-extproc; \
