@@ -373,11 +373,6 @@ async fn handle_request_headers(
 }
 
 /// Handle request body: accumulate chunks, run pipeline on EOS.
-///
-/// In `FULL_DUPLEX_STREAMED` mode, Envoy requires a response for every
-/// body chunk. Intermediate chunks are passed through unchanged; the
-/// pipeline runs at EOS and header mutations are emitted on the final
-/// response (with `clear_route_cache` so Envoy re-evaluates routing).
 async fn handle_request_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
@@ -391,9 +386,6 @@ async fn handle_request_body(
     state.request_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
-        if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed {
-            return Ok(vec![response::streamed_passthrough(&body.body, false, true)]);
-        }
         return Ok(Vec::new());
     }
 
@@ -425,9 +417,6 @@ async fn handle_response_headers(
 }
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
-///
-/// In `FULL_DUPLEX_STREAMED` mode, intermediate chunks are passed
-/// through unchanged; the pipeline runs at EOS.
 async fn handle_response_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
@@ -441,9 +430,6 @@ async fn handle_response_body(
     state.response_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
-        if state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed {
-            return Ok(vec![response::streamed_passthrough(&body.body, false, false)]);
-        }
         return Ok(Vec::new());
     }
 
@@ -517,10 +503,6 @@ enum ResponsePhase {
 /// Execute response pipeline for the given phase.
 ///
 /// Returns headers or body response with mutations.
-///
-/// When request headers were never received (e.g. an upstream filter
-/// rejected during decode before this filter ran), returns a
-/// passthrough response without running filters.
 #[expect(clippy::too_many_lines, reason = "context borrowing prevents extraction")]
 async fn run_response_pipeline(
     phase: ResponsePhase,
@@ -528,8 +510,7 @@ async fn run_response_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        debug!("skipping response pipeline: request headers not received");
-        return Ok(build_response_for_phase(phase, None, &state.response_body, state.protocol_config.response_body_mode));
+        return Err(Status::invalid_argument("request headers not received"));
     };
 
     let mut resp = state

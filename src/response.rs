@@ -216,10 +216,6 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 /// When body data is present, populates `body_mutation` so Envoy
 /// applies the filter-modified body. Large bodies are split into
 /// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
-///
-/// Sets `clear_route_cache` on request-body responses that carry
-/// header mutations so Envoy re-evaluates routing with the updated
-/// headers (e.g. model-name extracted from the JSON body).
 fn body_responses(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
@@ -231,13 +227,11 @@ fn body_responses(
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
             // BUFFERED mode (and others): use BodyMutation::Body for full replacement
             let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
-            let clear_route_cache = is_request && mutation.is_some();
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
                 header_mutation: mutation,
                 body_mutation,
-                clear_route_cache,
                 ..Default::default()
             };
 
@@ -285,14 +279,6 @@ fn body_responses_streamed(
     responses
 }
 
-/// Build a passthrough streamed body response for an intermediate chunk.
-///
-/// Used in `FULL_DUPLEX_STREAMED` mode to satisfy Envoy's requirement
-/// that every body chunk receives a response.
-pub(crate) fn streamed_passthrough(chunk: &[u8], end_of_stream: bool, is_request: bool) -> ProcessingResponse {
-    make_streamed_response(chunk, end_of_stream, None, is_request)
-}
-
 /// Build a single streamed body response with chunk data.
 fn make_streamed_response(
     chunk: &[u8],
@@ -309,14 +295,11 @@ fn make_streamed_response(
         mutation: Some(body_mutation::Mutation::StreamedResponse(streamed)),
     });
 
-    let clear_route_cache = is_request && header_mutation.is_some();
-
     wrap_body_response(
         CommonResponse {
             status: ResponseStatus::Continue.into(),
             header_mutation,
             body_mutation,
-            clear_route_cache,
             ..Default::default()
         },
         is_request,
