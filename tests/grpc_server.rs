@@ -1260,6 +1260,128 @@ async fn full_duplex_response_body() {
 }
 
 // -----------------------------------------------------------------------------
+// Response-only stream (no prior request_headers)
+// -----------------------------------------------------------------------------
+
+/// When an upstream filter (ext_authz, wasm) rejects before the request
+/// reaches this ext_proc, Envoy only sends response_headers — never
+/// request_headers. The server must pass through gracefully instead of
+/// returning InvalidArgument("request headers not received").
+#[tokio::test]
+async fn response_headers_without_request_passthrough() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":status", "403"),
+                    make_header("content-type", "text/plain"),
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(Some(resp))) => {
+            assert!(
+                matches!(&resp.response, Some(RespVariant::ResponseHeaders(_))),
+                "should passthrough ResponseHeaders when request was never received, got: {resp:?}"
+            );
+        },
+        Ok(Err(err)) => panic!(
+            "server returned error instead of passthrough: {err} — \
+             this is the bug: run_response_pipeline rejects with \
+             InvalidArgument when state.request is None"
+        ),
+        Ok(Ok(None)) => panic!("stream closed without response"),
+        Err(_) => panic!("timed out waiting for response"),
+    }
+}
+
+/// Same scenario but with a response body following the headers.
+/// response_headers (non-EOS) passes through via run_response_header_filters_early,
+/// but response_body (EOS) hits run_response_pipeline which crashes.
+#[tokio::test]
+async fn response_body_without_request_passthrough() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![make_header(":status", "403")],
+            }),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp1 = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for response headers")
+    .expect("stream error on response headers")
+    .expect("stream closed before response headers");
+
+    assert!(
+        matches!(&resp1.response, Some(RespVariant::ResponseHeaders(_))),
+        "should passthrough response headers, got: {resp1:?}"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"Forbidden".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(Some(resp))) => {
+            assert!(
+                matches!(&resp.response, Some(RespVariant::ResponseBody(_))),
+                "should passthrough response body when request was never received, got: {resp:?}"
+            );
+        },
+        Ok(Err(err)) => panic!(
+            "server returned error on response body: {err} — \
+             run_response_pipeline rejects with InvalidArgument \
+             when state.request is None"
+        ),
+        Ok(Ok(None)) => panic!("stream closed without body response"),
+        Err(_) => panic!("timed out waiting for body response"),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
