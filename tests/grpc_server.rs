@@ -1267,8 +1267,13 @@ async fn full_duplex_response_body() {
 /// reaches this ext_proc, Envoy only sends response_headers — never
 /// request_headers. The server must pass through gracefully instead of
 /// returning InvalidArgument("request headers not received").
+///
+/// Uses FULL_DUPLEX_STREAMED protocol_config to match the real MaaS
+/// dual ext_proc topology where this bug was observed.
 #[tokio::test]
 async fn response_headers_without_request_passthrough() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
@@ -1284,6 +1289,11 @@ async fn response_headers_without_request_passthrough() {
             }),
             end_of_stream: true,
         })),
+        protocol_config: Some(ProtocolConfiguration {
+            request_body_mode: 4,
+            response_body_mode: 4,
+            send_body_without_waiting_for_header_response: true,
+        }),
         ..Default::default()
     })
     .await
@@ -1317,6 +1327,8 @@ async fn response_headers_without_request_passthrough() {
 /// but response_body (EOS) hits run_response_pipeline which crashes.
 #[tokio::test]
 async fn response_body_without_request_passthrough() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
@@ -1329,6 +1341,11 @@ async fn response_body_without_request_passthrough() {
             }),
             end_of_stream: false,
         })),
+        protocol_config: Some(ProtocolConfiguration {
+            request_body_mode: 4,
+            response_body_mode: 4,
+            send_body_without_waiting_for_header_response: true,
+        }),
         ..Default::default()
     })
     .await
