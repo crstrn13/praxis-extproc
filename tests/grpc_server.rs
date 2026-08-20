@@ -1001,7 +1001,7 @@ async fn empty_full_duplex_emits_streamed_eos() {
     });
     tx.send(headers).await.unwrap();
 
-    let _unused = response_stream.message().await.unwrap();
+    // FD_STREAMED defers the header response — no message expected here.
 
     tx.send(ProcessingRequest {
         request: Some(ReqVariant::RequestBody(HttpBody {
@@ -1013,6 +1013,22 @@ async fn empty_full_duplex_emits_streamed_eos() {
     .await
     .unwrap();
 
+    // First response after body EOS: deferred RequestHeaders.
+    let deferred = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for deferred headers")
+    .expect("deferred headers stream error")
+    .expect("stream closed before deferred headers");
+
+    assert!(
+        matches!(&deferred.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be deferred RequestHeaders, got: {deferred:?}"
+    );
+
+    // Second response: StreamedBodyResponse for the empty body.
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(TIMEOUT_MILLIS),
         response_stream.message(),
@@ -1021,21 +1037,6 @@ async fn empty_full_duplex_emits_streamed_eos() {
 
     match outcome {
         Ok(Ok(Some(msg))) => {
-            let has_streamed = matches!(
-                &msg.response,
-                Some(RespVariant::RequestBody(b))
-                    if matches!(
-                        b.response.as_ref()
-                            .and_then(|c| c.body_mutation.as_ref())
-                            .and_then(|m| m.mutation.as_ref()),
-                        Some(body_mutation::Mutation::StreamedResponse(_))
-                    )
-            );
-            assert!(
-                has_streamed,
-                "expected StreamedBodyResponse for empty FULL_DUPLEX body, got: {msg:?}"
-            );
-
             if let Some(RespVariant::RequestBody(b)) = &msg.response
                 && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
                     .response
@@ -1051,6 +1052,8 @@ async fn empty_full_duplex_emits_streamed_eos() {
                     s.end_of_stream,
                     "empty FULL_DUPLEX streamed chunk must set end_of_stream"
                 );
+            } else {
+                panic!("expected StreamedBodyResponse for empty FULL_DUPLEX body, got: {msg:?}");
             }
         },
         Ok(Ok(None)) => panic!("ap-empty-full-duplex: stream closed without response"),
@@ -1076,14 +1079,7 @@ async fn full_duplex_single_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    // FD_STREAMED defers the header response — no message expected here.
 
     let body_data = vec![0_u8; 1024];
     tx.send(ProcessingRequest {
@@ -1096,6 +1092,22 @@ async fn full_duplex_single_chunk_request_body() {
     .await
     .unwrap();
 
+    // First response after body EOS: deferred RequestHeaders.
+    let deferred = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for deferred headers")
+    .expect("deferred headers stream error")
+    .expect("stream closed before deferred headers");
+
+    assert!(
+        matches!(&deferred.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be deferred RequestHeaders, got: {deferred:?}"
+    );
+
+    // Second response: StreamedBodyResponse with the body data.
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(TIMEOUT_MILLIS),
         response_stream.message(),
@@ -1141,14 +1153,7 @@ async fn full_duplex_multi_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    // FD_STREAMED defers the header response — no message expected here.
 
     let body_data: Vec<u8> = (0_u32..100_000).map(|i| (i % 251) as u8).collect();
     tx.send(ProcessingRequest {
@@ -1161,6 +1166,22 @@ async fn full_duplex_multi_chunk_request_body() {
     .await
     .unwrap();
 
+    // First response after body EOS: deferred RequestHeaders.
+    let deferred = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for deferred headers")
+    .expect("deferred headers stream error")
+    .expect("stream closed before deferred headers");
+
+    assert!(
+        matches!(&deferred.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be deferred RequestHeaders, got: {deferred:?}"
+    );
+
+    // Remaining responses: StreamedBodyResponse chunks.
     let (chunks, received_body) = collect_streamed_chunks(
         &mut response_stream,
         |msg| {

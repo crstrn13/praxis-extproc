@@ -127,6 +127,36 @@ pub(crate) fn request_body(
     body_responses(body, mutation, true, body_mode)
 }
 
+/// Build responses for `FULL_DUPLEX_STREAMED` request body phase.
+///
+/// Envoy's `handleDuplexStreamedBodyResponse` silently ignores
+/// `header_mutation` on body responses. To apply body-derived header
+/// mutations (e.g. routing headers from `model_to_header`), we send a
+/// deferred `HeadersResponse` first — whose mutations Envoy always
+/// applies — followed by `StreamedBodyResponse` chunks for the data.
+pub(crate) fn request_body_fd_streamed(
+    body: Option<&[u8]>,
+    mutation: Option<HeaderMutation>,
+) -> Vec<ProcessingResponse> {
+    let clear_route_cache = mutation.is_some();
+
+    let deferred_headers = ProcessingResponse {
+        response: Some(Response::RequestHeaders(HeadersResponse {
+            response: Some(CommonResponse {
+                status: ResponseStatus::Continue.into(),
+                header_mutation: mutation,
+                clear_route_cache,
+                ..Default::default()
+            }),
+        })),
+        ..Default::default()
+    };
+
+    let mut responses = vec![deferred_headers];
+    responses.extend(body_responses_streamed(body, None, true));
+    responses
+}
+
 /// Build [`ProcessingResponse`] messages for the response body phase.
 ///
 /// Same chunking logic as [`request_body`] but wraps in `ResponseBody`.
@@ -138,6 +168,19 @@ pub(crate) fn response_body(
     body_mode: BodyMode,
 ) -> Vec<ProcessingResponse> {
     body_responses(body, mutation, false, body_mode)
+}
+
+/// Build a passthrough response body (no mutations, original data).
+pub(crate) fn response_body_passthrough(body: Option<&[u8]>, body_mode: BodyMode) -> ProcessingResponse {
+    body_responses(body, None, false, body_mode).into_iter().next().unwrap_or_else(|| {
+        wrap_body_response(
+            CommonResponse {
+                status: ResponseStatus::Continue.into(),
+                ..Default::default()
+            },
+            false,
+        )
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -225,13 +268,14 @@ fn body_responses(
     match body_mode {
         BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request),
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
-            // BUFFERED mode (and others): use BodyMutation::Body for full replacement
             let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
+            let clear_route_cache = is_request && mutation.is_some();
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
                 header_mutation: mutation,
                 body_mutation,
+                clear_route_cache,
                 ..Default::default()
             };
 
@@ -295,11 +339,14 @@ fn make_streamed_response(
         mutation: Some(body_mutation::Mutation::StreamedResponse(streamed)),
     });
 
+    let clear_route_cache = is_request && header_mutation.is_some();
+
     wrap_body_response(
         CommonResponse {
             status: ResponseStatus::Continue.into(),
             header_mutation,
             body_mutation,
+            clear_route_cache,
             ..Default::default()
         },
         is_request,
