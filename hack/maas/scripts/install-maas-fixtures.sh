@@ -14,7 +14,7 @@ kc create namespace "$MODEL_NAMESPACE" --dry-run=client -o yaml | kc apply -f -
 kc create namespace "$INTERNAL_MODEL_NAMESPACE" --dry-run=client -o yaml | kc apply -f -
 kc create namespace "$SUBSCRIPTION_NAMESPACE" --dry-run=client -o yaml | kc apply -f -
 
-if ! kc get externalmodel llm-katan-openai -n "$MODEL_NAMESPACE" &>/dev/null; then
+if ! kc get externalmodel llm-katan-echo -n "$MODEL_NAMESPACE" &>/dev/null; then
   kc apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -29,7 +29,7 @@ stringData:
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: ExternalModel
 metadata:
-  name: llm-katan-openai
+  name: llm-katan-echo
   namespace: ${MODEL_NAMESPACE}
 spec:
   endpoint: "${LLM_KATAN_FQDN}"
@@ -41,12 +41,12 @@ spec:
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:
-  name: llm-katan-openai
+  name: llm-katan-echo
   namespace: ${MODEL_NAMESPACE}
 spec:
   modelRef:
     kind: ExternalModel
-    name: llm-katan-openai
+    name: llm-katan-echo
 EOF
   ok "External model fixtures applied"
 else
@@ -147,7 +147,7 @@ spec:
       - name: system:authenticated
     users: []
   modelRefs:
-    - name: llm-katan-openai
+    - name: llm-katan-echo
       namespace: ${MODEL_NAMESPACE}
       tokenRateLimits:
         - limit: 100
@@ -166,7 +166,7 @@ metadata:
   namespace: ${SUBSCRIPTION_NAMESPACE}
 spec:
   modelRefs:
-    - name: llm-katan-openai
+    - name: llm-katan-echo
       namespace: ${MODEL_NAMESPACE}
     - name: sim-internal
       namespace: ${INTERNAL_MODEL_NAMESPACE}
@@ -182,7 +182,7 @@ fi
 
 echo "  Waiting for controller reconciliation..."
 sleep 20
-EXTERNAL_PHASE=$(kc get maasmodelref llm-katan-openai -n "$MODEL_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+EXTERNAL_PHASE=$(kc get maasmodelref llm-katan-echo -n "$MODEL_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
 INTERNAL_PHASE=$(kc get maasmodelref sim-internal -n "$INTERNAL_MODEL_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
 [[ "$EXTERNAL_PHASE" == "Ready" ]] && ok "External model: Ready" || warn "External model: ${EXTERNAL_PHASE:-unknown}"
 [[ "$INTERNAL_PHASE" == "Ready" ]] && ok "Internal model: Ready" || warn "Internal model: ${INTERNAL_PHASE:-Pending}"

@@ -518,4 +518,34 @@ for deploy in payload-processing payload-pre-processing; do
   fi
 done
 
+# -- FULL_DUPLEX_STREAMED body mode -------------------------------------------
+# The xks-praxis overlay deploys the EnvoyFilter with BUFFERED body mode.
+# Patch every ext_proc processing_mode to FULL_DUPLEX_STREAMED so the deferred
+# header response pattern is exercised.
+if kc get envoyfilter payload-processing -n "$GATEWAY_NAMESPACE" &>/dev/null; then
+  PATCH_OPS=$(kc get envoyfilter payload-processing -n "$GATEWAY_NAMESPACE" -o json | python3 -c "
+import sys, json
+ef = json.load(sys.stdin)
+ops = []
+for i, p in enumerate(ef['spec']['configPatches']):
+    val = p.get('patch', {}).get('value', p.get('value', {}))
+    pm = val.get('typed_config', {}).get('processing_mode')
+    if not pm:
+        continue
+    base = f'/spec/configPatches/{i}/patch/value/typed_config/processing_mode'
+    if pm.get('request_body_mode') == 'BUFFERED':
+        ops.append({'op': 'replace', 'path': f'{base}/request_body_mode', 'value': 'FULL_DUPLEX_STREAMED'})
+    if pm.get('response_body_mode') == 'BUFFERED':
+        ops.append({'op': 'replace', 'path': f'{base}/response_body_mode', 'value': 'FULL_DUPLEX_STREAMED'})
+print(json.dumps(ops))
+")
+  if [[ "$PATCH_OPS" != "[]" ]]; then
+    kc patch envoyfilter payload-processing -n "$GATEWAY_NAMESPACE" --type=json \
+      -p="$PATCH_OPS"
+    ok "EnvoyFilter patched to FULL_DUPLEX_STREAMED"
+  else
+    ok "EnvoyFilter already uses FULL_DUPLEX_STREAMED"
+  fi
+fi
+
 ok "MaaS platform deploy finished"
