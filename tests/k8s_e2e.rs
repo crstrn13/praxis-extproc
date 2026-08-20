@@ -407,6 +407,113 @@ async fn large_body_passthrough() {
 }
 
 // ---------------------------------------------------------------------------
+// FD_STREAMED regression — model_to_header routing
+// ---------------------------------------------------------------------------
+
+/// Verify that `model_to_header` header mutations are applied in
+/// `FULL_DUPLEX_STREAMED` mode.
+///
+/// Envoy's `handleDuplexStreamedBodyResponse` silently ignores
+/// `header_mutation` on `StreamedBodyResponse`. The deferred-header
+/// fix sends a `HeadersResponse` first (whose mutations Envoy
+/// applies), followed by `StreamedBodyResponse` chunks.
+///
+/// Sends to `/model-routed/v1/chat/completions` which is routed via
+/// an `HTTPRoute` that **requires** the `X-Model-Name` header set by
+/// `model_to_header`. Without the deferred-header fix the mutation is
+/// silently dropped and the route returns 404.
+#[tokio::test]
+async fn fd_streamed_model_routing() {
+    ensure_gateway_ready().await;
+    let client = http_client();
+    let url = format!("{}/model-routed/v1/chat/completions", gateway_url());
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "model_to_header routing must work in FD_STREAMED mode; \
+         404 means the X-Model-Name header mutation was silently \
+         ignored by Envoy's handleDuplexStreamedBodyResponse"
+    );
+}
+
+/// Same as `fd_streamed_model_routing` but with streaming enabled.
+///
+/// Streaming responses exercise the response-body FD_STREAMED path
+/// in addition to the request-body deferral path.
+#[tokio::test]
+async fn fd_streamed_model_routing_streaming() {
+    ensure_gateway_ready().await;
+    let client = http_client();
+    let url = format!("{}/model-routed/v1/chat/completions", gateway_url());
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "streaming completion through model-routed path must succeed"
+    );
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .expect("missing content-type")
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected text/event-stream, got {content_type}"
+    );
+}
+
+/// Verify that a large body (> 62 KiB chunking threshold) works
+/// through the FD_STREAMED deferred-header + model-routed path.
+#[tokio::test]
+async fn fd_streamed_large_body_model_routing() {
+    ensure_gateway_ready().await;
+    let client = http_client();
+    let url = format!("{}/model-routed/v1/chat/completions", gateway_url());
+
+    let large_content = "x".repeat(100_000);
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": large_content}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "large body through model-routed FD_STREAMED path must succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Error handling — invalid auth
 // ---------------------------------------------------------------------------
 

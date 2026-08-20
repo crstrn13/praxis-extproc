@@ -369,6 +369,16 @@ async fn handle_request_headers(
         return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
+    // In FULL_DUPLEX_STREAMED mode, defer the header response until body
+    // processing completes. Envoy applies header mutations from
+    // HeadersResponse but silently ignores them from StreamedBodyResponse
+    // (handleDuplexStreamedBodyResponse skips processHeaderMutation).
+    // Deferring lets body-derived mutations (e.g. model_to_header routing
+    // headers) ride the deferred HeadersResponse where they take effect.
+    if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed {
+        return Ok(Vec::new());
+    }
+
     Ok(vec![response::request_headers(None)])
 }
 
@@ -482,11 +492,13 @@ async fn run_request_pipeline(
         RequestPhase::Headers => Ok(vec![response::request_headers(mutation)]),
         RequestPhase::Body => {
             let body_data = body_data_if_present(&state.request_body);
-            Ok(response::request_body(
-                body_data,
-                mutation,
-                state.protocol_config.request_body_mode,
-            ))
+            let body_mode = state.protocol_config.request_body_mode;
+
+            if body_mode == BodyMode::FullDuplexStreamed {
+                return Ok(response::request_body_fd_streamed(body_data, mutation));
+            }
+
+            Ok(response::request_body(body_data, mutation, body_mode))
         },
     }
 }
@@ -510,7 +522,16 @@ async fn run_response_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Err(Status::invalid_argument("request headers not received"));
+        // Request headers were never received — a filter earlier in the
+        // chain (e.g. ext_authz) rejected the request before it reached
+        // this ext_proc.  Pass the response through unchanged.
+        return Ok(match phase {
+            ResponsePhase::Headers => vec![response::response_headers(None)],
+            ResponsePhase::Body => {
+                let body_data = body_data_if_present(&state.response_body);
+                vec![response::response_body_passthrough(body_data, state.protocol_config.response_body_mode)]
+            },
+        });
     };
 
     let mut resp = state

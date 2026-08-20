@@ -68,3 +68,33 @@ spec:
       backendRefs:
         - name: llm-katan
           port: 443
+---
+# Header-gated route: requires X-Model-Name (set by model_to_header filter).
+# In FULL_DUPLEX_STREAMED mode Envoy silently ignores header_mutation on
+# StreamedBodyResponse, so model_to_header mutations only reach the route
+# table when the ext_proc uses the deferred HeadersResponse pattern.
+# Without the fix this route returns 404; with the fix it returns 200.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: model-routed
+  namespace: default
+spec:
+  parentRefs:
+    - name: e2e-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /model-routed/v1
+          headers:
+            - name: X-Model-Name
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1
+      backendRefs:
+        - name: llm-katan
+          port: 443
