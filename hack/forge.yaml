@@ -72,10 +72,16 @@ spec:
     praxis:
       description: Praxis ext-proc namespace, config, deployment, and service
       steps:
-        - type: manifest
-          path: manifests/praxis.yaml
+        - type: exec
+          command:
+            - kubectl
+            - apply
+            - -k
+            - ../deploy/overlays/e2e/workload
+            - --context
+            - kind-praxis-{{ cluster.name }}
         - type: wait
-          resource: deployment/praxis
+          resource: deployment/payload-processing
           namespace: praxis-extproc
           condition: available
           timeout: "120s"
@@ -83,10 +89,14 @@ spec:
     gateway:
       description: llm-katan backend, Gateway, HTTPRoute, and EnvoyFilter
       steps:
-        - type: manifest
-          path: manifests/gateway.yaml
-        - type: manifest
-          path: manifests/envoyfilter.yaml
+        - type: exec
+          command:
+            - kubectl
+            - apply
+            - -k
+            - ../deploy/overlays/e2e/test
+            - --context
+            - kind-praxis-{{ cluster.name }}
         - type: wait
           resource: gateway/e2e-gateway
           condition: Programmed
