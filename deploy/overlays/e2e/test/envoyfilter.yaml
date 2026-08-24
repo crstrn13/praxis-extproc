@@ -31,7 +31,7 @@ spec:
               common_tls_context:
                 validation_context:
                   trust_chain_verification: ACCEPT_UNTRUSTED
-              sni: praxis.praxis-extproc.svc.cluster.local
+              sni: payload-processing.praxis-extproc.svc.cluster.local
           load_assignment:
             cluster_name: praxis-extproc-grpc
             endpoints:
@@ -39,7 +39,7 @@ spec:
                   - endpoint:
                       address:
                         socket_address:
-                          address: praxis.praxis-extproc.svc.cluster.local
+                          address: payload-processing.praxis-extproc.svc.cluster.local
                           port_value: 9004
     - applyTo: HTTP_FILTER
       match:
