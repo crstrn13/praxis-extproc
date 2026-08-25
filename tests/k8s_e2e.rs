@@ -96,6 +96,7 @@ async fn chat_completion_200() {
         .expect("request failed");
 
     assert_eq!(resp.status(), 200, "chat completion should return 200");
+    assert_praxis_mutations(&resp);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,7 @@ async fn response_has_openai_structure() {
         .expect("request failed");
 
     assert_eq!(resp.status(), 200);
+    assert_praxis_mutations(&resp);
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
 
@@ -488,6 +490,12 @@ async fn empty_messages_rejected() {
 // ---------------------------------------------------------------------------
 // Test utilities
 // ---------------------------------------------------------------------------
+
+fn assert_praxis_mutations(resp: &reqwest::Response) {
+    resp.headers()
+        .get("X-Praxis-Version")
+        .expect("missing X-Praxis-Version — ext-proc response mutations not applied (FDS deferral broken?)");
+}
 
 fn gateway_url() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
