@@ -1,6 +1,4 @@
-use crate::fixtures::{
-    assert_praxis_mutations, chat_completion, ensure_gateway_ready, gateway_url, http_client,
-};
+use crate::fixtures::{assert_praxis_mutations, chat_completion, ensure_gateway_ready, gateway_url, http_client};
 
 #[tokio::test]
 async fn smoke_200() {
@@ -66,8 +64,7 @@ async fn streaming() {
 #[tokio::test]
 async fn json_mode() {
     ensure_gateway_ready().await;
-    let resp =
-        chat_completion("gpt-4", "Return a JSON object with key 'greeting'").await;
+    let resp = chat_completion("gpt-4", "Return a JSON object with key 'greeting'").await;
 
     assert_eq!(resp.status(), 200);
 
@@ -75,8 +72,7 @@ async fn json_mode() {
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .expect("content should be a string");
-    serde_json::from_str::<serde_json::Value>(content)
-        .expect("content should be valid JSON");
+    serde_json::from_str::<serde_json::Value>(content).expect("content should be valid JSON");
 }
 
 #[tokio::test]

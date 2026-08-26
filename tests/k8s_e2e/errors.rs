@@ -1,6 +1,4 @@
-use crate::fixtures::{
-    chat_completion, ensure_gateway_ready, gateway_url, http_client, REQUEST_TIMEOUT,
-};
+use crate::fixtures::{REQUEST_TIMEOUT, chat_completion, ensure_gateway_ready, gateway_url, http_client};
 
 #[tokio::test]
 async fn invalid_api_key_rejected() {

@@ -55,12 +55,10 @@ pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Resp
 /// `X-Praxis-Version` is set by the IPP ext-proc `headers` filter.
 /// Missing header means FDS deferral is broken or IPP is not running.
 pub(crate) fn assert_praxis_mutations(resp: &reqwest::Response) {
-    resp.headers()
-        .get("X-Praxis-Version")
-        .expect(
-            "missing X-Praxis-Version — IPP response mutations not applied \
+    resp.headers().get("X-Praxis-Version").expect(
+        "missing X-Praxis-Version — IPP response mutations not applied \
              (FDS deferral broken or IPP ext-proc not running)",
-        );
+    );
 }
 
 pub(crate) fn gateway_url() -> String {
@@ -81,4 +79,3 @@ pub(crate) fn http_client() -> reqwest::Client {
         .build()
         .expect("failed to build HTTP client")
 }
-
