@@ -124,18 +124,20 @@ smoke-test:
 # ---------------------------------------------------------------------------
 
 FORGE_BIN    ?= praxis-forge
-FORGE_CONFIG := hack/forge.yaml
+FORGE_CONFIG := forge.yaml
+INFERENCE_SIM_IMAGE ?= ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
+FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONTAINER_ENGINE))"
 
 e2e-setup: images
-	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster create e2e
-	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster load-image e2e "$(EXTPROC_IMAGE)"
-	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" stack apply e2e
+	$(FORGE_CMD) cluster create e2e
+	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
+	$(FORGE_CMD) stack apply e2e
 
 e2e-teardown:
-	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster delete e2e
+	$(FORGE_CMD) cluster delete e2e
 
 e2e-test:
-	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
+	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e -n istio-system get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
 	cargo test --features k8s-e2e --test k8s_e2e $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------

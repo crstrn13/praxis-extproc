@@ -6,7 +6,6 @@ metadata:
 
 spec:
   runtime:
-    # add podman support? is it supported by MetalLB?
     provider: docker
     clusterPrefix: praxis
 
@@ -40,7 +39,7 @@ spec:
         - type: exec
           command:
             - bash
-            - scripts/install-metallb-pool.sh
+            - hack/scripts/install-metallb-pool.sh
             - kind-praxis-{{ cluster.name }}
 
     gateway-api:
@@ -71,34 +70,45 @@ spec:
           timeout: "120s"
 
     praxis:
-      description: Praxis ext-proc namespace, config, deployment, and service
+      description: Praxis ext-proc deployments (BBR + IPP) in istio-system
       steps:
         - type: exec
           command:
             - kubectl
             - apply
             - -k
-            - ../deploy/overlays/e2e/workload
+            - deploy/overlays/e2e/workload
             - --context
             - kind-praxis-{{ cluster.name }}
         - type: wait
+          resource: deployment/payload-pre-processing
+          namespace: istio-system
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: deployment/payload-processing
-          namespace: praxis-extproc
+          namespace: istio-system
           condition: available
           timeout: "120s"
 
     gateway:
-      description: llm-katan backend, Gateway, HTTPRoute, and EnvoyFilter
+      description: Gateway, HTTPRoutes, EnvoyFilter, and model backends
       steps:
         - type: exec
           command:
             - kubectl
             - apply
             - -k
-            - ../deploy/overlays/e2e/test
+            - deploy/overlays/e2e/test
             - --context
             - kind-praxis-{{ cluster.name }}
         - type: wait
+          resource: deployment/internal-model
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: gateway/e2e-gateway
+          namespace: istio-system
           condition: Programmed
           timeout: "120s"

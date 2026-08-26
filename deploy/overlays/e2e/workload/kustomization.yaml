@@ -1,11 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: praxis-extproc
+namespace: istio-system
 
 resources:
   - ../../../base
-  - namespace.yaml
+  - pre-processing-configmap.yaml
+  - pre-processing-deployment.yaml
+  - pre-processing-service.yaml
 
 images:
   - name: praxis-extproc

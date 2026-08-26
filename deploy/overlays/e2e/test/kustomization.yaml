@@ -4,3 +4,4 @@ kind: Kustomization
 resources:
   - gateway.yaml
   - envoyfilter.yaml
+  - internal-model.yaml
