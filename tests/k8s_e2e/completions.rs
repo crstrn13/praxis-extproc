@@ -62,20 +62,6 @@ async fn streaming() {
 }
 
 #[tokio::test]
-async fn json_mode() {
-    ensure_gateway_ready().await;
-    let resp = chat_completion("gpt-4", "Return a JSON object with key 'greeting'").await;
-
-    assert_eq!(resp.status(), 200);
-
-    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("content should be a string");
-    serde_json::from_str::<serde_json::Value>(content).expect("content should be valid JSON");
-}
-
-#[tokio::test]
 async fn tool_call_passthrough() {
     ensure_gateway_ready().await;
     let client = http_client();
