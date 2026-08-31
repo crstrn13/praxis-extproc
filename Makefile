@@ -16,10 +16,8 @@
 CONTAINER_ENGINE  ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 V                 ?=
 KIND_CLUSTER_NAME ?= praxis-extproc
-# Fully-qualified so the tag on the Kind node matches what Kubernetes resolves
-# the pod's bare `praxis-extproc:dev` image to (docker.io/library/...). podman
-# tags local builds as `localhost/...`, which would NOT match and breaks
-# `imagePullPolicy: Never` (ErrImageNeverPull); docker is unaffected.
+# Fully-qualified: podman tags local builds `localhost/...`, which won't match
+# the `docker.io/library/...` Kubernetes resolves to under `imagePullPolicy: Never`.
 EXTPROC_IMAGE     ?= docker.io/library/praxis-extproc:dev
 KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
 
