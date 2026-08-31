@@ -16,7 +16,11 @@
 CONTAINER_ENGINE  ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 V                 ?=
 KIND_CLUSTER_NAME ?= praxis-extproc
-EXTPROC_IMAGE     ?= praxis-extproc:dev
+# Fully-qualified so the tag on the Kind node matches what Kubernetes resolves
+# the pod's bare `praxis-extproc:dev` image to (docker.io/library/...). podman
+# tags local builds as `localhost/...`, which would NOT match and breaks
+# `imagePullPolicy: Never` (ErrImageNeverPull); docker is unaffected.
+EXTPROC_IMAGE     ?= docker.io/library/praxis-extproc:dev
 KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
 
 ifneq ($(V),)
@@ -137,8 +141,7 @@ e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
 
 e2e-test:
-	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e -n istio-system get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
-	cargo test --features k8s-e2e --test k8s_e2e $(if $(V),-- --nocapture,)
+	bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
@@ -182,7 +185,7 @@ help:
 	@echo "  V=1                show test output (--nocapture)"
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
-	@echo "  EXTPROC_IMAGE      container image tag (default: praxis-extproc:dev)"
+	@echo "  EXTPROC_IMAGE      container image tag (default: docker.io/library/praxis-extproc:dev)"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + lint + test + audit"
