@@ -323,6 +323,23 @@ fn header_value_option(key: &str, value: &str) -> HeaderValueOption {
     }
 }
 
+/// Overwrite `content-length` on a header mutation to `len` bytes.
+///
+/// Creates the mutation if absent and drops any prior `content-length`
+/// entry so the declared size matches the body actually emitted.
+pub(crate) fn set_content_length(mutation: Option<HeaderMutation>, len: usize) -> HeaderMutation {
+    let mut mutation = mutation.unwrap_or_default();
+    mutation.set_headers.retain(|h| {
+        h.header
+            .as_ref()
+            .is_none_or(|hv| !hv.key.eq_ignore_ascii_case("content-length"))
+    });
+    mutation
+        .set_headers
+        .push(header_value_option("content-length", &len.to_string()));
+    mutation
+}
+
 /// Convert rejection header pairs to a [`HeaderMutation`].
 fn rejection_headers_to_mutation(headers: &[(String, String)]) -> HeaderMutation {
     let set_headers = headers
@@ -706,6 +723,67 @@ mod tests {
             header_value_str(&hv),
             "text",
             "should use value when raw_value is empty"
+        );
+    }
+
+    #[test]
+    fn set_content_length_creates_mutation_when_absent() {
+        let mutation = set_content_length(None, 42);
+
+        let cl = mutation
+            .set_headers
+            .iter()
+            .find(|h| h.header.as_ref().unwrap().key == "content-length")
+            .expect("content-length should be set");
+        assert_eq!(cl.header.as_ref().unwrap().value, "42", "should carry the byte length");
+    }
+
+    #[test]
+    fn set_content_length_overwrites_stale_value() {
+        let existing = HeaderMutation {
+            set_headers: vec![header_value_option("content-length", "999")],
+            remove_headers: vec![],
+        };
+
+        let mutation = set_content_length(Some(existing), 7);
+
+        let entries: Vec<_> = mutation
+            .set_headers
+            .iter()
+            .filter(|h| h.header.as_ref().unwrap().key.eq_ignore_ascii_case("content-length"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "stale content-length should be replaced, not duplicated"
+        );
+        assert_eq!(
+            entries[0].header.as_ref().unwrap().value,
+            "7",
+            "value should reflect new length"
+        );
+    }
+
+    #[test]
+    fn set_content_length_preserves_other_headers() {
+        let existing = HeaderMutation {
+            set_headers: vec![header_value_option("x-keep", "yes")],
+            remove_headers: vec!["x-drop".to_owned()],
+        };
+
+        let mutation = set_content_length(Some(existing), 3);
+
+        assert!(
+            mutation
+                .set_headers
+                .iter()
+                .any(|h| h.header.as_ref().unwrap().key == "x-keep"),
+            "unrelated set header should be preserved"
+        );
+        assert_eq!(
+            mutation.remove_headers,
+            vec!["x-drop".to_owned()],
+            "remove list untouched"
         );
     }
 
