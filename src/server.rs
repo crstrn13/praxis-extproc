@@ -534,7 +534,10 @@ async fn run_request_pipeline(
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
-    let body = body_data_if_present(&state.request_body);
+    // Emit the authoritative buffer even when empty: a filter that cleared the
+    // body must produce an explicit empty body AND content-length: 0. Collapsing
+    // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
+    let body = Some(state.request_body.as_slice());
     Ok(build_request_for_phase(
         phase,
         with_content_length(mutation, body, original_len),
@@ -598,7 +601,10 @@ async fn run_response_pipeline(
         },
     };
 
-    let body = body_data_if_present(&state.response_body);
+    // Emit the authoritative buffer even when empty: a filter that cleared the
+    // body must produce an explicit empty body AND content-length: 0. Collapsing
+    // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
+    let body = Some(state.response_body.as_slice());
     Ok(build_response_for_phase(
         phase,
         with_content_length(mutation, body, original_len),
@@ -635,11 +641,11 @@ async fn execute_response_pipeline_and_body_filters(
 
 /// Set `content-length` when the emitted body differs in size from the original.
 ///
-/// Keeps the declared length in sync with the bytes actually sent to Envoy
-/// after a filter resizes the body. When the size is unchanged (or no body is
-/// emitted) the original `content-length` already matches, so the mutation is
-/// left untouched. `STREAMED` mode is unaffected: its headers are flushed
-/// before body filters run, so no correction is possible there.
+/// Keeps the declared length in sync with the bytes actually emitted to Envoy,
+/// including 0 when a filter clears the body. Left untouched only when the size
+/// is unchanged. Honored by Envoy in `BUFFERED` and in `FULL_DUPLEX_STREAMED` with
+/// `allow_content_length_header`; ignored (harmlessly) in `STREAMED`, where Envoy
+/// strips content-length and switches to chunked encoding.
 fn with_content_length(
     mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
     body: Option<&[u8]>,
@@ -1434,5 +1440,21 @@ mod tests {
     fn with_content_length_noop_without_body() {
         let mutation = with_content_length(None, None, 0);
         assert!(mutation.is_none(), "no emitted body means no content-length change");
+    }
+
+    /// Clearing a previously non-empty body must declare `content-length: 0`.
+    ///
+    /// The pipeline tails now pass the authoritative buffer as `Some` even when
+    /// empty, so `with_content_length` sees emitted len 0 != original and emits
+    /// the correction. Skipping it would leave a stale length against an empty
+    /// body -- a request-smuggling vector under FDS `allow_content_length_header`.
+    #[test]
+    fn with_content_length_corrects_when_body_cleared() {
+        let mutation = with_content_length(None, Some(b""), 100);
+        assert_eq!(
+            content_length_of(&mutation).as_deref(),
+            Some("0"),
+            "clearing the body must declare content-length: 0"
+        );
     }
 }
