@@ -15,7 +15,7 @@ use std::{collections::HashMap, net::IpAddr, time::Instant};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use praxis_filter::{BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
 use praxis_proto::envoy::service::{
-    common::v3::{HeaderValue, HeaderValueOption, HttpStatus},
+    common::v3::{HeaderValue, HeaderValueOption, HttpStatus, header_value_option::HeaderAppendAction},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
 };
 
@@ -149,7 +149,7 @@ pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<H
     let mut set_headers: Vec<HeaderValueOption> = ctx
         .extra_request_headers
         .iter()
-        .map(|(name, value)| header_value_option(name, value))
+        .map(|(name, value)| header_value_option_append(name, value))
         .collect();
 
     set_headers.extend(
@@ -308,11 +308,33 @@ fn extract_client_addr(request: &Request) -> Option<IpAddr> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// Build a single [`HeaderValueOption`] from key and value strings.
+/// Build a [`HeaderValueOption`] that overwrites any existing header of the
+/// same key (or adds it if absent).
 ///
-/// Sets both `value` and `raw_value` for maximum compatibility
-/// across Envoy versions.
+/// Correct for single-valued headers (`content-length`, `:path`, `:authority`)
+/// and explicit set/replace mutations: without `OverwriteIfExistsOrAdd`, Envoy
+/// would append the new value alongside an original the client already sent,
+/// producing an invalid multi-valued header. Sets both `value` and `raw_value`
+/// for maximum compatibility across Envoy versions.
 fn header_value_option(key: &str, value: &str) -> HeaderValueOption {
+    HeaderValueOption {
+        header: Some(HeaderValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            raw_value: value.as_bytes().to_vec(),
+        }),
+        append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
+        append: None,
+    }
+}
+
+/// Build a [`HeaderValueOption`] that appends to any existing header of the
+/// same key (protobuf default `APPEND_IF_EXISTS_OR_ADD`).
+///
+/// Used for injected extra headers, where a filter may legitimately add a
+/// value alongside one the client already sent. Sets both `value` and
+/// `raw_value` for maximum compatibility across Envoy versions.
+fn header_value_option_append(key: &str, value: &str) -> HeaderValueOption {
     HeaderValueOption {
         header: Some(HeaderValue {
             key: key.to_owned(),
@@ -493,6 +515,11 @@ mod tests {
             "x-added",
             "key should match"
         );
+        assert_eq!(
+            mutation.set_headers[0].append_action,
+            i32::from(HeaderAppendAction::AppendIfExistsOrAdd),
+            "injected extra headers should append, not overwrite an existing value"
+        );
     }
 
     #[test]
@@ -512,6 +539,11 @@ mod tests {
             path_header.unwrap().header.as_ref().unwrap().value,
             "/new/path",
             ":path value should match rewritten path"
+        );
+        assert_eq!(
+            path_header.unwrap().append_action,
+            i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd),
+            ":path is single-valued and must overwrite the original"
         );
     }
 
@@ -736,6 +768,11 @@ mod tests {
             .find(|h| h.header.as_ref().unwrap().key == "content-length")
             .expect("content-length should be set");
         assert_eq!(cl.header.as_ref().unwrap().value, "42", "should carry the byte length");
+        assert_eq!(
+            cl.append_action,
+            i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd),
+            "content-length must overwrite an original header, not append a second value"
+        );
     }
 
     #[test]
