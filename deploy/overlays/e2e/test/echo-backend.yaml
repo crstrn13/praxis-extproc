@@ -1,0 +1,117 @@
+# Header-echo backend for the #422 credential-strip golden. It reflects the
+# request headers Envoy forwarded (post-ext-proc mutation) back in the response
+# body as JSON, so a test can assert the *negative*: the caller's Authorization
+# / x-api-key never crossed the trust boundary to the upstream. Mirrors the
+# hardened nemo-stub shape (non-root, read-only rootfs, dropped caps).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-backend-script
+  namespace: llm
+data:
+  server.py: |
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _echo(self):
+            length = int(self.headers.get("content-length", 0) or 0)
+            if length:
+                self.rfile.read(length)
+            body = json.dumps({
+                "path": self.path,
+                "method": self.command,
+                # Lower-cased header names; the last value wins per Python's
+                # email.message, which is sufficient for the strip assertions.
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+            }).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _echo
+        do_POST = _echo
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-backend
+  namespace: llm
+  labels:
+    app: echo-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-backend
+  template:
+    metadata:
+      labels:
+        app: echo-backend
+    spec:
+      containers:
+        - name: echo-backend
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-u", "/app/server.py"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: echo-backend-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-backend
+  namespace: llm
+  labels:
+    app: echo-backend
+spec:
+  selector:
+    app: echo-backend
+  ports:
+    - port: 8080
+      targetPort: 8080

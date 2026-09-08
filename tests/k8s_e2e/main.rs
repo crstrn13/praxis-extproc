@@ -39,8 +39,14 @@
 
 mod fixtures;
 
+mod ai_guardrails;
 mod completions;
+mod credential_strip;
 mod direct;
 mod errors;
 mod filters;
+mod guardrails;
+mod observability;
 mod routing;
+mod token_usage;
+mod trust_boundary;

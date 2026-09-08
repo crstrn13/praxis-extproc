@@ -10,10 +10,76 @@ data:
       metrics_address: "0.0.0.0:9090"
       tls:
         mode: self_signed
-
     filter_chains:
       - name: ipp
         filters:
+          # Story 6 — Observability: echo a client-supplied correlation ID
+          # back on the response so callers can correlate. Uses a custom
+          # header (NOT x-request-id, which Envoy generates/overwrites before
+          # the ext-proc ever sees it).
+          - filter: request_id
+            header_name: X-Correlation-ID
+
+          # Story 5 — Guardrails: reject request bodies containing a
+          # forbidden literal. Global (no conditions): benign bodies pass,
+          # a body with "DROP TABLE" is rejected with 403.
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "DROP TABLE"
+
+          # Story 2 — Trust boundary: replace the caller-supplied bearer
+          # token with the real upstream credential, scoped to the /trust
+          # prefix. On other paths the client's own Authorization is left
+          # untouched (so errors::invalid_api_key_rejected still sees 401).
+          - filter: headers
+            conditions:
+              - when:
+                  path_prefix: "/trust"
+            request_set:
+              - name: Authorization
+                value: "Bearer llm-katan-openai-key"
+
+          # P2 · #422 — credential strip: on the /echo prefix, strip the
+          # caller's client credentials so they never reach the upstream.
+          # `request_remove` is exact-name (the caller's `x-api-key`); the
+          # caller `Authorization` is replaced with the real upstream token.
+          # NOTE: this is the exact-name mechanism. Prefix stripping (e.g.
+          # `x-maas-*`) is NOT expressible here — praxis `headers`
+          # `request_remove` takes concrete names only (same gap as PR #52).
+          - filter: headers
+            conditions:
+              - when:
+                  path_prefix: "/echo"
+            request_remove:
+              - x-api-key
+            request_set:
+              - name: Authorization
+                value: "Bearer echo-upstream-secret"
+
+          # Story 3 — AI guardrails (external provider): call a NeMo Guardrails
+          # endpoint on the request body, gated on an opt-in request header. A
+          # "blocked" verdict short-circuits with 403; "passed" forwards
+          # upstream. The filter (and its external callout) runs only when the
+          # caller sends `X-Guardrails: on` — requests without it skip the
+          # filter entirely. Header conditions are exact name+value matches
+          # (the pinned core has no presence-only `headers_exists`). Request
+          # phase only (default), so the request conditions fully scope it —
+          # no response-phase leakage.
+          - filter: ai_guardrails
+            conditions:
+              - when:
+                  headers:
+                    x-guardrails: "on"
+            provider:
+              type: nemo
+              endpoint: "http://nemo-stub.llm.svc.cluster.local:3001/v1/guardrail/checks"
+              # The stub is an in-cluster (private) address; praxis-ai v0.3.0's
+              # NeMo callout blocks private endpoints by default (SSRF guard).
+              allow_private_endpoint: true
+
+          # Story 7 — Response mutation (existing): mark processed requests
+          # and stamp the Praxis version on every response.
           - filter: headers
             request_add:
               - name: X-Praxis-Processed
@@ -22,5 +88,18 @@ data:
               - name: X-Praxis-Version
                 value: "e2e"
 
+          # Story 4 — Token accounting: parse usage from the upstream
+          # response and surface it as Praxis-Token-* response headers.
+          #
+          # KNOWN LIMITATION (see tests/k8s_e2e/token_usage.rs): under the
+          # ext-proc two-pass FDS response model, all on_response (header)
+          # hooks run before all on_response_body hooks. token_count sets its
+          # usage metadata in the body hook, so token_usage_headers (a header
+          # hook) runs first and sees no metadata — the Praxis-Token-* headers
+          # are never emitted. Kept here to document the intended wiring; the
+          # gap is in praxis-extproc's response execution ordering, not config.
+          - filter: token_count
+            provider: openai
+          - filter: token_usage_headers
     insecure_options:
       allow_unbounded_body: true

@@ -1,0 +1,126 @@
+# Minimal NeMo Guardrails stub for e2e validation of the `ai_guardrails`
+# filter. It speaks the real /v1/guardrail/checks contract the filter expects
+# ({"status": "success" | "blocked"}) without pulling in the full
+# NVIDIA NeMo Guardrails stack: any message whose content contains the trigger
+# word "jailbreak" is blocked, everything else passes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemo-stub-script
+  namespace: llm
+data:
+  server.py: |
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    TRIGGER = "jailbreak"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._send(200, {"status": "ok"})
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", 0) or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                messages = json.loads(raw).get("messages", [])
+                blocked = TRIGGER in json.dumps(messages).lower()
+            except Exception:
+                blocked = False
+            if blocked:
+                self._send(200, {
+                    "status": "blocked",
+                    "rails_status": {"self check input": {"status": "blocked"}},
+                })
+            else:
+                self._send(200, {"status": "success"})
+
+        def _send(self, code, body):
+            payload = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", 3001), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nemo-stub
+  namespace: llm
+  labels:
+    app: nemo-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nemo-stub
+  template:
+    metadata:
+      labels:
+        app: nemo-stub
+    spec:
+      containers:
+        - name: nemo-stub
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-u", "/app/server.py"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - containerPort: 3001
+              name: http
+              protocol: TCP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: nemo-stub-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nemo-stub
+  namespace: llm
+  labels:
+    app: nemo-stub
+spec:
+  selector:
+    app: nemo-stub
+  ports:
+    - port: 3001
+      targetPort: 3001

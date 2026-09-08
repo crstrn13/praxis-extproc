@@ -65,6 +65,38 @@ pub(crate) fn gateway_url() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
 }
 
+/// Build an HTTP client that sends the given bearer token verbatim.
+///
+/// Used to exercise the trust boundary: a caller presents a bogus token
+/// and the IPP ext-proc replaces it with the real upstream credential.
+pub(crate) fn http_client_with_auth(token: &str) -> reqwest::Client {
+    use reqwest::header;
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        header::HeaderValue::from_str(&format!("Bearer {token}")).expect("invalid token"),
+    );
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .default_headers(headers)
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// POST a chat-completion body to an arbitrary gateway path.
+pub(crate) async fn post_chat(client: &reqwest::Client, path: &str, model: &str, content: &str) -> reqwest::Response {
+    let url = format!("{}{path}", gateway_url());
+    client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .send()
+        .await
+        .expect("request failed")
+}
+
 /// Build an HTTP client with the llm-katan auth token pre-configured.
 pub(crate) fn http_client() -> reqwest::Client {
     use reqwest::header;

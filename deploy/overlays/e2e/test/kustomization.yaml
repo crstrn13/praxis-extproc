@@ -5,3 +5,5 @@ resources:
   - gateway.yaml
   - envoyfilter.yaml
   - internal-model.yaml
+  - nemo-stub.yaml
+  - echo-backend.yaml

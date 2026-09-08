@@ -147,3 +147,33 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
+    # Credential-strip golden: /echo/v1/... → echo-backend, which reflects the
+    # headers Envoy forwarded. The IPP ext-proc strips the caller's client
+    # credentials on this prefix; the test reads the echoed headers to prove
+    # they never reached the upstream.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /echo/v1
+      backendRefs:
+        - name: echo-backend
+          namespace: llm
+          port: 8080
+    # Trust boundary: /trust/v1/... → llm-katan. The IPP ext-proc matches
+    # the /trust prefix (before this URLRewrite strips it) and replaces the
+    # caller's Authorization with the real upstream credential, so a request
+    # bearing a bogus client token still succeeds.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /trust/v1
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1
+      backendRefs:
+        - name: llm-katan
+          namespace: llm
+          port: 443
