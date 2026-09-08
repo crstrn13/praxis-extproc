@@ -241,6 +241,32 @@ filter_chains:
     }
 
     #[test]
+    fn build_pipeline_with_ai_guardrails_nemo() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers:
+                x-guardrails: "on"
+        provider:
+          type: nemo
+          endpoint: "http://nemo-stub.llm.svc.cluster.local:3001/v1/guardrail/checks"
+          allow_private_endpoint: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert_eq!(pipeline.len(), 1, "pipeline should have the ai_guardrails filter");
+    }
+
+    #[test]
     fn build_pipeline_unknown_filter_fails() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"

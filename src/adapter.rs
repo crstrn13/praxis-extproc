@@ -13,7 +13,9 @@
 use std::{collections::HashMap, net::IpAddr, time::Instant};
 
 use http::{HeaderMap, Method, StatusCode, Uri};
-use praxis_filter::{BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
+use praxis_filter::{
+    BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response, SubRequestResponseMode,
+};
 use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption, HttpStatus},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
@@ -105,7 +107,9 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         health_registry: pipeline.health_registry(),
         id_generator: pipeline.id_generator(),
         kv_stores: pipeline.kv_stores(),
+        session_stores: pipeline.session_stores(),
         subrequest_client: pipeline.subrequest_client(),
+        subrequest_response_mode: SubRequestResponseMode::default(),
         request,
         request_body_bytes: 0,
         request_body_mode: BodyMode::Stream,
@@ -115,6 +119,15 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         response_header: None,
         response_headers_modified: false,
         selected_endpoint_index: None,
+        // Retry / endpoint-reselection state is advisory in ExtProc mode:
+        // Envoy owns routing and retries, so these stay unset.
+        attempted_endpoints: Vec::new(),
+        retry_policy: None,
+        route_retry_policy: None,
+        cluster_retry_state: None,
+        cluster_retry_state_released: false,
+        endpoint_reselector: None,
+        pinned_endpoint_address: None,
         time_source: pipeline.time_source(),
         rewritten_path: None,
         upstream: None,
