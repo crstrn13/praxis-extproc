@@ -2013,6 +2013,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "state_probe"
         }
+
         async fn on_request(
             &self,
             ctx: &mut HttpFilterContext<'_>,
@@ -2020,6 +2021,7 @@ mod tests {
             ctx.insert_filter_state(Probe(PROBE_VALUE));
             Ok(FilterAction::Continue)
         }
+
         async fn on_response(
             &self,
             ctx: &mut HttpFilterContext<'_>,
@@ -2031,7 +2033,10 @@ mod tests {
     }
     impl ProbeFilter {
         /// Registry factory for `state_probe`.
-        fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
             Ok(Box::new(Self))
         }
     }
@@ -2043,10 +2048,9 @@ mod tests {
         use praxis_filter::FilterRegistry;
 
         PROBE_OBSERVED.store(0, Ordering::SeqCst);
-        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
-            "filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n",
-        )
-        .unwrap();
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
+                .unwrap();
         let mut registry = FilterRegistry::with_builtins();
         registry
             .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
