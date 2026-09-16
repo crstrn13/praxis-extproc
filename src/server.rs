@@ -1997,4 +1997,82 @@ mod tests {
         );
         assert_eq!(count, 1, "missing response headers must increment the counter");
     }
+
+    /// Typed marker a probe filter stashes on request and reads on response.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Probe(u64);
+    /// Sentinel value carried through `filter_state`.
+    const PROBE_VALUE: u64 = 0x00C0_FFEE;
+    /// Value the probe observed in `on_response` (0 if state was lost).
+    static PROBE_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Filter that stores `Probe` on request and reports it back on response.
+    struct ProbeFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ProbeFilter {
+        fn name(&self) -> &'static str {
+            "state_probe"
+        }
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.insert_filter_state(Probe(PROBE_VALUE));
+            Ok(FilterAction::Continue)
+        }
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            let observed = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
+            PROBE_OBSERVED.store(observed, std::sync::atomic::Ordering::SeqCst);
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl ProbeFilter {
+        /// Registry factory for `state_probe`.
+        fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_state_survives_request_to_response_phase() {
+        use std::sync::atomic::Ordering;
+
+        use praxis_filter::FilterRegistry;
+
+        PROBE_OBSERVED.store(0, Ordering::SeqCst);
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n",
+        )
+        .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Request phase stores state; it must be moved out into StreamState.
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert!(
+            state.filter_state.contains_key(&0),
+            "request-phase filter_state must persist into StreamState"
+        );
+
+        // Response phase builds a fresh ctx; state must be moved back in.
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            PROBE_OBSERVED.load(Ordering::SeqCst),
+            PROBE_VALUE,
+            "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
+        );
+    }
 }
