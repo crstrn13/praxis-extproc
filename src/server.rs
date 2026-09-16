@@ -721,6 +721,7 @@ async fn run_request_pipeline(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
@@ -764,6 +765,7 @@ async fn run_response_pipeline(
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
 
@@ -949,6 +951,7 @@ async fn process_streamed_body_chunk(
     })?;
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
     if !is_request {
         let resp = state.response.as_mut().ok_or_else(|| {
             metrics::record_invalid_argument("missing_headers", "response");
@@ -969,6 +972,7 @@ async fn process_streamed_body_chunk(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let (mutation, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
@@ -1059,6 +1063,7 @@ async fn run_request_header_filters_early(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let mutation = adapter::collect_request_header_mutations(&ctx);
 
     Ok(delivery.deliver_request(mutation, state))
@@ -1076,6 +1081,7 @@ async fn run_response_header_filters_early(
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
 
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
@@ -1090,6 +1096,8 @@ async fn run_response_header_filters_early(
     }
 
     state.header_state.response_filters_executed = true;
+    // Move filter_state back so the response-body phase's fresh ctx still sees it.
+    state.filter_state = mem::take(&mut ctx.filter_state);
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
     Ok(delivery.deliver_response(mutation, state))
@@ -1234,6 +1242,9 @@ struct StreamState {
 
     /// Metadata carried from request to response phase.
     filter_metadata: HashMap<String, String>,
+
+    /// Typed per-filter state carried from request to response phase.
+    filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 
     /// Converted request from the headers phase.
     request: Option<Request>,
