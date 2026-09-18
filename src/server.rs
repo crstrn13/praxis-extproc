@@ -1084,13 +1084,7 @@ async fn run_response_header_filters_early(
     }
 
     state.header_state.response_filters_executed = true;
-    // Persist the ctx state produced by the early response execution so it
-    // survives into the body phase. Filters communicate response-headers ->
-    // response-body decisions through this carried state (e.g. the anthropic
-    // messages->chat-completions filter records RESPONSE_TRANSFORM_KEY in
-    // on_response and reads it in on_response_body). Because BUFFERED runs the
-    // response pipeline here and then skips execute_response at body EOS, that
-    // state would otherwise be dropped, silently disabling the transform.
+    // Carry state into the body phase.
     state.carried.carry_out(&mut ctx);
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
@@ -2029,63 +2023,14 @@ mod tests {
     struct Probe(u64);
     /// Sentinel value carried through `filter_state`.
     const PROBE_VALUE: u64 = 0x00C0_FFEE;
-    /// Value the probe observed in `on_response` (0 if state was lost).
-    static PROBE_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    /// Filter that stores `Probe` on request and reports it back on response.
-    struct ProbeFilter;
-    #[async_trait::async_trait]
-    impl praxis_filter::HttpFilter for ProbeFilter {
-        fn name(&self) -> &'static str {
-            "state_probe"
-        }
-
-        async fn on_request(
-            &self,
-            ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            ctx.insert_filter_state(Probe(PROBE_VALUE));
-            Ok(FilterAction::Continue)
-        }
-
-        async fn on_response(
-            &self,
-            ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            let observed = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
-            PROBE_OBSERVED.store(observed, std::sync::atomic::Ordering::SeqCst);
-            Ok(FilterAction::Continue)
-        }
-    }
-    impl ProbeFilter {
-        /// Registry factory for `state_probe`.
-        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
-        fn from_config(
-            _: &serde_yaml::Value,
-        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
-            Ok(Box::new(Self))
-        }
-    }
 
     #[tokio::test]
     async fn filter_state_survives_request_to_response_phase() {
-        use std::sync::atomic::Ordering;
-
-        use praxis_filter::FilterRegistry;
-
-        PROBE_OBSERVED.store(0, Ordering::SeqCst);
-        let cfg: crate::config::ExtProcConfig =
-            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
-                .unwrap();
-        let mut registry = FilterRegistry::with_builtins();
-        registry
-            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
-            .unwrap();
-        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let pipeline = carry_probe_pipeline();
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
-        // Request phase stores state; it must be moved out into StreamState.
+        // Request phase stores state; it must persist into StreamState.
         run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
             .await
             .unwrap();
@@ -2094,26 +2039,21 @@ mod tests {
             "request-phase filter_state must persist into StreamState"
         );
 
-        // Response phase builds a fresh ctx; state must be moved back in.
+        // Response phase restores state; the probe surfaces what it observed.
         state.response = Some(adapter::envoy_headers_to_response(&[]));
-        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
             .await
             .unwrap();
-        assert_eq!(
-            PROBE_OBSERVED.load(Ordering::SeqCst),
-            PROBE_VALUE,
-            "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
-        );
+        assert_observed_header(&responses, PROBE_VALUE.to_string().as_str());
     }
 
-    /// Probe used by the streamed and early-header carry tests. It stashes a
-    /// typed marker + a metadata breadcrumb on the request side and, on the
-    /// response side, records into metadata whether it observed each. Results
-    /// are read back from the local `StreamState`, so these tests share no
-    /// mutable globals and stay correct when run concurrently.
+    /// Probe that stashes state on the request side and records what it
+    /// observes on the response side.
     struct CarryProbe;
 
     impl CarryProbe {
+        /// Response header surfacing the observed value on the terminal path.
+        const OBSERVED_HEADER: &'static str = "x-carry-observed-state";
         /// Records whether the response side observed the request metadata.
         const OBSERVED_META_KEY: &'static str = "carry_probe.observed_meta";
         /// Records the `filter_state` value the response side observed.
@@ -2127,12 +2067,17 @@ mod tests {
             ctx.set_metadata(Self::REQUEST_KEY, "seen");
         }
 
-        /// Record, into metadata, what the response side observed of the carry.
+        /// Record what the response side observed of the carry, into metadata
+        /// and, when response headers are present, as a header.
         fn observe(ctx: &mut HttpFilterContext<'_>) {
             let state = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
             let meta = u8::from(ctx.get_metadata(Self::REQUEST_KEY).is_some());
             ctx.set_metadata(Self::OBSERVED_STATE_KEY, state.to_string());
             ctx.set_metadata(Self::OBSERVED_META_KEY, meta.to_string());
+            if let Some(resp) = ctx.response_header.as_deref_mut() {
+                resp.headers
+                    .insert(Self::OBSERVED_HEADER, state.to_string().parse().unwrap());
+            }
         }
 
         /// Registry factory for `carry_probe`.
@@ -2231,6 +2176,29 @@ mod tests {
         );
     }
 
+    /// Assert a response carries the observed-state header with `expected`.
+    fn assert_observed_header(responses: &[ProcessingResponse], expected: &str) {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response;
+
+        let found = responses.iter().any(|r| match &r.response {
+            Some(Response::ResponseHeaders(h)) => h
+                .response
+                .as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some_and(|m| {
+                    m.set_headers
+                        .iter()
+                        .filter_map(|hv| hv.header.as_ref())
+                        .any(|hv| hv.key.eq_ignore_ascii_case(CarryProbe::OBSERVED_HEADER) && hv.value == expected)
+                }),
+            _ => false,
+        });
+        assert!(
+            found,
+            "on_response must observe carried state and surface it as a header"
+        );
+    }
+
     #[tokio::test]
     async fn carried_state_survives_streamed_body_phases() {
         use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
@@ -2289,16 +2257,7 @@ mod tests {
         assert_carry_observed(&state);
     }
 
-    /// Completeness guard: every carried context field survives a
-    /// `carry_out` -> `carry_in` round trip, and `carry_out` drains the
-    /// source context.
-    ///
-    /// This test exists to fail loudly when the set of cross-phase fields
-    /// changes. Destructuring [`CarriedState`] below turns "a field was added
-    /// to `CarriedState` but not round-tripped here" into a compile error; the
-    /// per-field asserts turn "a field is not moved by `carry_out`/`carry_in`"
-    /// into a test failure. When praxis grows a new [`HttpFilterContext`]
-    /// carried field, add it to `CarriedState`, both carry methods, and here.
+    /// Completeness guard: every carried field survives a round trip.
     #[test]
     #[expect(
         clippy::too_many_lines,
