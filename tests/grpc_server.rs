@@ -347,7 +347,8 @@ async fn buffered_response_transform_metadata_survives_body_phase() {
     // Anthropic-shaped request body: on_request_body records the transform intent.
     tx.send(ProcessingRequest {
         request: Some(ReqVariant::RequestBody(HttpBody {
-            body: br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#.to_vec(),
+            body: br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#
+                .to_vec(),
             end_of_stream: true,
         })),
         ..Default::default()
