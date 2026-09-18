@@ -1243,6 +1243,11 @@ struct CarriedState {
     /// String metadata carried across phases (e.g. filter decisions).
     filter_metadata: HashMap<String, String>,
 
+    /// Namespaced structured (JSON) metadata carried across phases. Praxis's
+    /// pingora data plane already carries this across the pipeline; ext-proc
+    /// must match so filters relying on it behave identically under both.
+    structured_metadata: HashMap<String, serde_json::Value>,
+
     /// Typed per-filter state carried across phases.
     filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 }
@@ -1254,6 +1259,7 @@ impl CarriedState {
         self.branch_iterations = mem::take(&mut ctx.branch_iterations);
         self.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
         self.filter_metadata = mem::take(&mut ctx.filter_metadata);
+        self.structured_metadata = mem::take(&mut ctx.structured_metadata);
         self.filter_state = mem::take(&mut ctx.filter_state);
     }
 
@@ -1265,6 +1271,7 @@ impl CarriedState {
         ctx.branch_iterations.clone_from(&self.branch_iterations);
         ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
         ctx.filter_metadata.clone_from(&self.filter_metadata);
+        ctx.structured_metadata.clone_from(&self.structured_metadata);
         ctx.filter_state = mem::take(&mut self.filter_state);
     }
 }
@@ -2114,21 +2121,28 @@ mod tests {
         const OBSERVED_META_KEY: &'static str = "carry_probe.observed_meta";
         /// Records the `filter_state` value the response side observed.
         const OBSERVED_STATE_KEY: &'static str = "carry_probe.observed_state";
+        /// Records whether the response side observed the structured metadata.
+        const OBSERVED_STRUCT_KEY: &'static str = "carry_probe.observed_struct";
         /// Breadcrumb the request side leaves for the response side.
         const REQUEST_KEY: &'static str = "carry_probe.request";
+        /// Structured-metadata namespace the request side writes.
+        const STRUCT_NS: &'static str = "carry_probe";
 
-        /// Stash typed state + a metadata breadcrumb on the request side.
+        /// Stash typed state + metadata + structured metadata on the request side.
         fn stash(ctx: &mut HttpFilterContext<'_>) {
             ctx.insert_filter_state(Probe(PROBE_VALUE));
             ctx.set_metadata(Self::REQUEST_KEY, "seen");
+            ctx.set_structured_metadata(Self::STRUCT_NS, "flag", serde_json::json!(true));
         }
 
         /// Record, into metadata, what the response side observed of the carry.
         fn observe(ctx: &mut HttpFilterContext<'_>) {
             let state = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
             let meta = u8::from(ctx.get_metadata(Self::REQUEST_KEY).is_some());
+            let structured = u8::from(ctx.get_structured_metadata(Self::STRUCT_NS, "flag").is_some());
             ctx.set_metadata(Self::OBSERVED_STATE_KEY, state.to_string());
             ctx.set_metadata(Self::OBSERVED_META_KEY, meta.to_string());
+            ctx.set_metadata(Self::OBSERVED_STRUCT_KEY, structured.to_string());
         }
 
         /// Registry factory for `carry_probe`.
@@ -2225,6 +2239,15 @@ mod tests {
             Some("1"),
             "response side must observe request-side filter_metadata carried across the phase boundary"
         );
+        assert_eq!(
+            state
+                .carried
+                .filter_metadata
+                .get(CarryProbe::OBSERVED_STRUCT_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "response side must observe request-side structured_metadata carried across the phase boundary"
+        );
     }
 
     #[tokio::test]
@@ -2309,6 +2332,8 @@ mod tests {
         ctx.branch_iterations.insert(Arc::from("branch-a"), 3);
         ctx.executed_filter_indices = vec![true, false, true];
         ctx.filter_metadata.insert("carry.meta".to_owned(), "kept".to_owned());
+        ctx.structured_metadata
+            .insert("carry.ns".to_owned(), serde_json::json!({ "kept": true }));
         ctx.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
 
         // carry_out must move every field out of the source context.
@@ -2323,6 +2348,10 @@ mod tests {
             "carry_out must drain executed_filter_indices"
         );
         assert!(ctx.filter_metadata.is_empty(), "carry_out must drain filter_metadata");
+        assert!(
+            ctx.structured_metadata.is_empty(),
+            "carry_out must drain structured_metadata"
+        );
         assert!(ctx.filter_state.is_empty(), "carry_out must drain filter_state");
 
         // Enumerate every carried field: a new field on `CarriedState` fails to
@@ -2331,11 +2360,16 @@ mod tests {
             branch_iterations,
             executed_filter_indices,
             filter_metadata,
+            structured_metadata,
             filter_state,
         } = &carried;
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
+        assert_eq!(
+            structured_metadata.get("carry.ns"),
+            Some(&serde_json::json!({ "kept": true }))
+        );
         assert!(filter_state.contains_key(&7));
 
         // carry_in must restore every field into a freshly built context.
@@ -2344,6 +2378,10 @@ mod tests {
         assert_eq!(fresh.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(fresh.executed_filter_indices, vec![true, false, true]);
         assert_eq!(fresh.get_metadata("carry.meta"), Some("kept"));
+        assert_eq!(
+            fresh.structured_metadata.get("carry.ns"),
+            Some(&serde_json::json!({ "kept": true }))
+        );
         let restored = fresh.filter_state.get(&7).and_then(|any| any.downcast_ref::<Probe>());
         assert_eq!(
             restored,
