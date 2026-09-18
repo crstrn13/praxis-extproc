@@ -232,6 +232,12 @@ fn body_responses(
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
+                // Body-based routing (e.g. model_to_header) derives its routing
+                // header from the body, so the mutation lands in the body phase.
+                // Under BUFFERED the route is already chosen at headers-time, so
+                // Envoy must re-route; mirror request_headers() and clear the
+                // cache whenever a request-phase body filter mutated headers.
+                clear_route_cache: is_request && mutation.is_some(),
                 header_mutation: mutation,
                 body_mutation,
                 ..Default::default()
@@ -302,6 +308,9 @@ fn make_streamed_response(
     wrap_body_response(
         CommonResponse {
             status: ResponseStatus::Continue.into(),
+            // See body_responses(): a body-phase routing header mutation must
+            // clear the route cache so Envoy re-routes on the new header.
+            clear_route_cache: is_request && header_mutation.is_some(),
             header_mutation,
             body_mutation,
             ..Default::default()
@@ -748,5 +757,69 @@ mod tests {
                 .and_then(|bm| bm.mutation.as_ref()),
             _ => None,
         }
+    }
+
+    fn extract_clear_route_cache(resp: &ProcessingResponse) -> bool {
+        match &resp.response {
+            Some(Response::RequestBody(b)) => b.response.as_ref().is_some_and(|c| c.clear_route_cache),
+            Some(Response::ResponseBody(b)) => b.response.as_ref().is_some_and(|c| c.clear_route_cache),
+            _ => false,
+        }
+    }
+
+    /// A body-phase header mutation on the request path must clear the route
+    /// cache so Envoy re-routes on the new header. This is what body-based
+    /// routing (`model_to_header`) relies on under BUFFERED, where the route is
+    /// already chosen at headers-time before the body-derived header exists.
+    #[test]
+    fn buffered_request_body_header_mutation_clears_route_cache() {
+        let mutation = HeaderMutation {
+            set_headers: vec![],
+            remove_headers: vec!["x-internal".to_owned()],
+        };
+        let responses = request_body(Some(b"{}"), Some(mutation), BodyMode::Buffered, true);
+
+        assert!(
+            extract_clear_route_cache(&responses[0]),
+            "BUFFERED request body with header mutation must clear the route cache"
+        );
+    }
+
+    #[test]
+    fn streamed_request_body_header_mutation_clears_route_cache() {
+        let mutation = HeaderMutation {
+            set_headers: vec![],
+            remove_headers: vec!["x-internal".to_owned()],
+        };
+        let responses = request_body(Some(b"{}"), Some(mutation), BodyMode::FullDuplexStreamed, true);
+
+        assert!(
+            extract_clear_route_cache(&responses[0]),
+            "streamed request body with header mutation must clear the route cache on the first chunk"
+        );
+    }
+
+    #[test]
+    fn request_body_without_mutation_leaves_route_cache() {
+        let responses = request_body(Some(b"{}"), None, BodyMode::Buffered, true);
+
+        assert!(
+            !extract_clear_route_cache(&responses[0]),
+            "request body without a header mutation must not clear the route cache"
+        );
+    }
+
+    #[test]
+    fn response_body_header_mutation_does_not_clear_route_cache() {
+        let mutation = HeaderMutation {
+            set_headers: vec![],
+            remove_headers: vec!["x-internal".to_owned()],
+        };
+        let responses = response_body(Some(b"{}"), Some(mutation), BodyMode::Buffered, true);
+
+        assert!(
+            !extract_clear_route_cache(&responses[0]),
+            "response-phase body mutations must never clear the route cache"
+        );
     }
 }
