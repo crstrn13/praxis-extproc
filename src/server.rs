@@ -2284,4 +2284,71 @@ mod tests {
 
         assert_carry_observed(&state);
     }
+
+    /// Completeness guard: every carried context field survives a
+    /// `carry_out` -> `carry_in` round trip, and `carry_out` drains the
+    /// source context.
+    ///
+    /// This test exists to fail loudly when the set of cross-phase fields
+    /// changes. Destructuring [`CarriedState`] below turns "a field was added
+    /// to `CarriedState` but not round-tripped here" into a compile error; the
+    /// per-field asserts turn "a field is not moved by `carry_out`/`carry_in`"
+    /// into a test failure. When praxis grows a new [`HttpFilterContext`]
+    /// carried field, add it to `CarriedState`, both carry methods, and here.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "per-field populate/assert is the point of the completeness guard"
+    )]
+    fn carried_state_round_trips_every_field() {
+        let pipeline = carry_probe_pipeline();
+        let request = adapter::envoy_headers_to_request(&[]);
+
+        // Populate every carried field with a distinct sentinel.
+        let mut ctx = adapter::build_filter_context(&pipeline, &request);
+        ctx.branch_iterations.insert(Arc::from("branch-a"), 3);
+        ctx.executed_filter_indices = vec![true, false, true];
+        ctx.filter_metadata.insert("carry.meta".to_owned(), "kept".to_owned());
+        ctx.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+
+        // carry_out must move every field out of the source context.
+        let mut carried = CarriedState::default();
+        carried.carry_out(&mut ctx);
+        assert!(
+            ctx.branch_iterations.is_empty(),
+            "carry_out must drain branch_iterations"
+        );
+        assert!(
+            ctx.executed_filter_indices.is_empty(),
+            "carry_out must drain executed_filter_indices"
+        );
+        assert!(ctx.filter_metadata.is_empty(), "carry_out must drain filter_metadata");
+        assert!(ctx.filter_state.is_empty(), "carry_out must drain filter_state");
+
+        // Enumerate every carried field: a new field on `CarriedState` fails to
+        // compile here until it is asserted.
+        let CarriedState {
+            branch_iterations,
+            executed_filter_indices,
+            filter_metadata,
+            filter_state,
+        } = &carried;
+        assert_eq!(branch_iterations.get("branch-a"), Some(&3));
+        assert_eq!(executed_filter_indices, &vec![true, false, true]);
+        assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
+        assert!(filter_state.contains_key(&7));
+
+        // carry_in must restore every field into a freshly built context.
+        let mut fresh = adapter::build_filter_context(&pipeline, &request);
+        carried.carry_in(&mut fresh);
+        assert_eq!(fresh.branch_iterations.get("branch-a"), Some(&3));
+        assert_eq!(fresh.executed_filter_indices, vec![true, false, true]);
+        assert_eq!(fresh.get_metadata("carry.meta"), Some("kept"));
+        let restored = fresh.filter_state.get(&7).and_then(|any| any.downcast_ref::<Probe>());
+        assert_eq!(
+            restored,
+            Some(&Probe(PROBE_VALUE)),
+            "carry_in must restore filter_state"
+        );
+    }
 }
