@@ -1096,7 +1096,16 @@ async fn run_response_header_filters_early(
     }
 
     state.header_state.response_filters_executed = true;
-    // Move filter_state back so the response-body phase's fresh ctx still sees it.
+    // Persist the ctx state produced by the early response execution so it
+    // survives into the body phase. Filters communicate response-headers ->
+    // response-body decisions through filter_metadata and filter_state (e.g. the
+    // anthropic messages->chat-completions filter records RESPONSE_TRANSFORM_KEY
+    // in on_response and reads it in on_response_body). Because BUFFERED runs the
+    // response pipeline here and then skips execute_response at body EOS, that
+    // state would otherwise be dropped, silently disabling the transform.
+    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
     state.filter_state = mem::take(&mut ctx.filter_state);
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
