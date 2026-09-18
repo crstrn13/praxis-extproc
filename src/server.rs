@@ -23,7 +23,7 @@ use praxis_proto::envoy::service::{
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     adapter, metrics,
@@ -1227,52 +1227,56 @@ impl HeaderDeliveryState {
 
 /// Cross-phase filter-context state carried between ExtProc phases.
 ///
-/// The ext-proc server builds a fresh [`HttpFilterContext`] for every phase
-/// (request/response headers and body, streamed chunks). Any state a filter
-/// shares across phases lives here and crosses the phase boundary only through
-/// [`CarriedState::carry_out`] / [`CarriedState::carry_in`] — the single choke
-/// point, so a newly added context field cannot be silently dropped.
+/// A fresh [`HttpFilterContext`] is built per phase, so these fields cross the
+/// boundary only through [`CarriedState::carry_out`] / [`CarriedState::carry_in`].
 #[derive(Debug, Default)]
 struct CarriedState {
-    /// Re-entrance counters from request-phase branch chains.
+    /// Branch re-entrance counters.
     branch_iterations: HashMap<Arc<str>, u32>,
 
-    /// Executed filter indices from earlier phases.
+    /// Filter indices executed in earlier phases.
     executed_filter_indices: Vec<bool>,
 
-    /// String metadata carried across phases (e.g. filter decisions).
+    /// Flat string metadata.
     filter_metadata: HashMap<String, String>,
 
-    /// Namespaced structured (JSON) metadata carried across phases. Praxis's
-    /// pingora data plane already carries this across the pipeline; ext-proc
-    /// must match so filters relying on it behave identically under both.
+    /// Namespaced JSON metadata (parity with praxis's pingora data plane).
     structured_metadata: HashMap<String, serde_json::Value>,
 
-    /// Typed per-filter state carried across phases.
+    /// Typed per-filter state.
     filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl CarriedState {
-    /// Move cross-phase context state out of `ctx` into `self` at the end of a
-    /// phase, so a later phase's fresh context can restore it.
+    /// Move cross-phase state out of `ctx` at phase end.
     fn carry_out(&mut self, ctx: &mut HttpFilterContext<'_>) {
         self.branch_iterations = mem::take(&mut ctx.branch_iterations);
         self.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
         self.filter_metadata = mem::take(&mut ctx.filter_metadata);
         self.structured_metadata = mem::take(&mut ctx.structured_metadata);
         self.filter_state = mem::take(&mut ctx.filter_state);
+        trace!(
+            filter_metadata = self.filter_metadata.len(),
+            structured_metadata = self.structured_metadata.len(),
+            filter_state = self.filter_state.len(),
+            "carried cross-phase state out of context"
+        );
     }
 
-    /// Restore cross-phase context state into a freshly built `ctx` at the start
-    /// of a phase. Cloneable fields are cloned so they remain available to later
-    /// phases; the typed `filter_state` map is not `Clone`, so it is moved (each
-    /// `carry_in` is paired with a subsequent `carry_out`).
+    /// Restore cross-phase state into a freshly built `ctx`. Cloneable maps are
+    /// cloned (kept for later phases); `filter_state` is moved.
     fn carry_in(&mut self, ctx: &mut HttpFilterContext<'_>) {
         ctx.branch_iterations.clone_from(&self.branch_iterations);
         ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
         ctx.filter_metadata.clone_from(&self.filter_metadata);
         ctx.structured_metadata.clone_from(&self.structured_metadata);
         ctx.filter_state = mem::take(&mut self.filter_state);
+        trace!(
+            filter_metadata = ctx.filter_metadata.len(),
+            structured_metadata = ctx.structured_metadata.len(),
+            filter_state = ctx.filter_state.len(),
+            "restored cross-phase state into context"
+        );
     }
 }
 

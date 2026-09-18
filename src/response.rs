@@ -213,9 +213,8 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 
 /// Build body response(s) with optional header mutation and body data.
 ///
-/// When body data is present, populates `body_mutation` so Envoy
-/// applies the filter-modified body. Large bodies are split into
-/// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
+/// Clears the route cache on request-phase header mutations so Envoy
+/// re-routes on body-derived routing headers (BBR under BUFFERED).
 fn body_responses(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
@@ -226,17 +225,10 @@ fn body_responses(
     match body_mode {
         BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request, end_of_stream),
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
-            // BUFFERED mode (and others): use BodyMutation::Body for full replacement.
-            // `Some(&[])` is an explicit clear (emit empty body); `None` = leave as-is.
             let body_mutation = body.map(make_body_mutation);
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
-                // Body-based routing (e.g. model_to_header) derives its routing
-                // header from the body, so the mutation lands in the body phase.
-                // Under BUFFERED the route is already chosen at headers-time, so
-                // Envoy must re-route; mirror request_headers() and clear the
-                // cache whenever a request-phase body filter mutated headers.
                 clear_route_cache: is_request && mutation.is_some(),
                 header_mutation: mutation,
                 body_mutation,
@@ -255,13 +247,10 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
     }
 }
 
-/// Build streamed body responses using `StreamedBodyResponse` wire format.
+/// Build streamed body responses, chunked at [`BODY_CHUNK_LIMIT`].
 ///
-/// Chunks the body at 62 KiB boundaries and returns responses. Each chunk
-/// is copied exactly once into its `ProcessingResponse`. The `end_of_stream`
-/// flag is propagated from the source chunk and applied only to the final
-/// sub-chunk, so framing is preserved when Envoy splits a body across
-/// multiple messages. Empty bodies still emit one `StreamedBodyResponse`.
+/// `end_of_stream` applies only to the final sub-chunk; empty bodies still
+/// emit one `StreamedBodyResponse`.
 fn body_responses_streamed(
     body: Option<&[u8]>,
     mut mutation: Option<HeaderMutation>,
@@ -277,7 +266,6 @@ fn body_responses_streamed(
 
     while offset < data.len() {
         let end = (offset + BODY_CHUNK_LIMIT).min(data.len());
-        // Only the final sub-chunk is EOS, and only if the source chunk was.
         let eos = end_of_stream && end == data.len();
         let chunk = data.get(offset..end).unwrap_or(&[]);
         let header_mut = if offset == 0 { mutation.take() } else { None };
@@ -308,8 +296,6 @@ fn make_streamed_response(
     wrap_body_response(
         CommonResponse {
             status: ResponseStatus::Continue.into(),
-            // See body_responses(): a body-phase routing header mutation must
-            // clear the route cache so Envoy re-routes on the new header.
             clear_route_cache: is_request && header_mutation.is_some(),
             header_mutation,
             body_mutation,
@@ -767,10 +753,6 @@ mod tests {
         }
     }
 
-    /// A body-phase header mutation on the request path must clear the route
-    /// cache so Envoy re-routes on the new header. This is what body-based
-    /// routing (`model_to_header`) relies on under BUFFERED, where the route is
-    /// already chosen at headers-time before the body-derived header exists.
     #[test]
     fn buffered_request_body_header_mutation_clears_route_cache() {
         let mutation = HeaderMutation {
