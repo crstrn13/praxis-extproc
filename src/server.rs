@@ -40,23 +40,34 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
 
-/// Guards the once-per-process warning about dropped `STREAMED` header mutations.
-static STREAMED_HEADER_MUTATIONS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Once-per-process warning: STREAMED body filters produced header mutations.
+static STREAMED_HEADER_MUTATIONS: OnceWarning = OnceWarning::new();
 
-/// Warn once per process when body filters produce header mutations that Envoy
-/// will not apply.
+// -----------------------------------------------------------------------------
+// OnceWarning
+// -----------------------------------------------------------------------------
+
+/// A configuration-mismatch warning that fires once per process.
 ///
-/// Envoy applies header mutations from a body response only in `BUFFERED` mode;
-/// under `STREAMED` the headers were already forwarded, so mutations a filter
-/// derives from the body are silently dropped. Surface that once so operators
-/// can switch the direction to `BUFFERED` or `FULL_DUPLEX_STREAMED`.
-fn warn_dropped_streamed_header_mutations(is_request: bool) {
-    if !STREAMED_HEADER_MUTATIONS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        warn!(
-            direction = if is_request { "request" } else { "response" },
-            "body filters produced header mutations under STREAMED, which Envoy applies only in BUFFERED mode; \
-             the mutations were dropped, switch the direction to BUFFERED or FULL_DUPLEX_STREAMED"
-        );
+/// The conditions these guard depend on the pipeline and on Envoy's
+/// processing mode, not on the request, so repeating them for every stream
+/// would only flood the log; later occurrences are logged at debug.
+struct OnceWarning(std::sync::atomic::AtomicBool);
+
+impl OnceWarning {
+    /// A warning that has not fired yet.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Whether this call is the first; every later call returns `false`.
+    fn first(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the warning has not fired yet, without firing it.
+    fn pending(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1060,6 +1071,7 @@ async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
+    warn_unapplied_header_mutations(&ctx, is_request, original_response_headers.as_ref());
 
     let current_mutation = if is_request {
         adapter::collect_request_header_mutations(&ctx)
@@ -1084,9 +1096,6 @@ async fn process_streamed_body_chunk(
         )
     };
     let mutation = merge_mutations(deferred, current_mutation);
-    if body_mode == BodyMode::Streamed && mutation.is_some() {
-        warn_dropped_streamed_header_mutations(is_request);
-    }
 
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
@@ -1095,6 +1104,38 @@ async fn process_streamed_body_chunk(
         response::response_body(body_data, mutation, body_mode, eos)
     };
     Ok(responses)
+}
+
+/// Warn (once per process) when body filters changed headers that Envoy will not apply.
+///
+/// Header mutations on a body response only take effect in `BUFFERED` mode.
+/// In `STREAMED` mode the headers were forwarded when the `HeadersResponse`
+/// went out, so a filter that derives headers from the body is silently
+/// ineffective. Surface that so operators can switch the direction to
+/// `BUFFERED` or `FULL_DUPLEX_STREAMED`.
+fn warn_unapplied_header_mutations(
+    ctx: &HttpFilterContext<'_>,
+    is_request: bool,
+    original_response_headers: Option<&HashMap<String, String>>,
+) {
+    if !STREAMED_HEADER_MUTATIONS.pending() {
+        return;
+    }
+    let mutation = if is_request {
+        adapter::collect_request_header_mutations(ctx)
+    } else {
+        original_response_headers.and_then(|original| adapter::collect_response_header_mutations_diff(ctx, original))
+    };
+    if let Some(mutation) = mutation
+        && STREAMED_HEADER_MUTATIONS.first()
+    {
+        warn!(
+            direction = if is_request { "request" } else { "response" },
+            set_headers = mutation.set_headers.len(),
+            remove_headers = mutation.remove_headers.len(),
+            "STREAMED body filters produced header mutations, which Envoy applies only in BUFFERED mode; dropped"
+        );
+    }
 }
 
 /// How header mutations are delivered after early filter execution.
