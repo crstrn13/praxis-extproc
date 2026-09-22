@@ -3,7 +3,7 @@ name = "praxis-extproc"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-authors = ["Shane Utt <shaneutt@linux.com>"]
+authors = ["Red Hat, Inc."]
 license = "Apache-2.0"
 repository = "https://github.com/opendatahub-io/praxis-extproc"
 description = "Envoy ExtProc server for Praxis filter pipelines"
@@ -41,7 +41,7 @@ openssl = "0.10.81"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"
-tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-openssl = "0.6.5"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tonic = { version = "0.14.6", features = ["transport"] }
