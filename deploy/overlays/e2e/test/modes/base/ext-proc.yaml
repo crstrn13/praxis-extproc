@@ -15,8 +15,8 @@ spec:
     # from the body, sets X-Gateway-Model-Name + clear_route_cache so
     # Envoy re-evaluates routes with the header present.
     #
-    # Body/trailer modes below are the FDS defaults; the buffered/ and
-    # streamed/ overlays patch them by configPatches index.
+    # Body/trailer modes below are the FDS defaults; the buffered/
+    # overlay patches them by configPatches index.
     # -----------------------------------------------------------------
     - applyTo: HTTP_FILTER
       match:

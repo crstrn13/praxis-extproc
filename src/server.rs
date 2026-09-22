@@ -40,6 +40,26 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
 
+/// Guards the once-per-process warning about dropped `STREAMED` header mutations.
+static STREAMED_HEADER_MUTATIONS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Warn once per process when body filters produce header mutations that Envoy
+/// will not apply.
+///
+/// Envoy applies header mutations from a body response only in `BUFFERED` mode;
+/// under `STREAMED` the headers were already forwarded, so mutations a filter
+/// derives from the body are silently dropped. Surface that once so operators
+/// can switch the direction to `BUFFERED` or `FULL_DUPLEX_STREAMED`.
+fn warn_dropped_streamed_header_mutations(is_request: bool) {
+    if !STREAMED_HEADER_MUTATIONS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            direction = if is_request { "request" } else { "response" },
+            "body filters produced header mutations under STREAMED, which Envoy applies only in BUFFERED mode; \
+             the mutations were dropped, switch the direction to BUFFERED or FULL_DUPLEX_STREAMED"
+        );
+    }
+}
+
 /// Parsed protocol configuration from Envoy.
 ///
 /// Extracted from the first `ProcessingRequest` message's `protocol_config` field.
@@ -1064,6 +1084,9 @@ async fn process_streamed_body_chunk(
         )
     };
     let mutation = merge_mutations(deferred, current_mutation);
+    if body_mode == BodyMode::Streamed && mutation.is_some() {
+        warn_dropped_streamed_header_mutations(is_request);
+    }
 
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
