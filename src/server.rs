@@ -412,8 +412,8 @@ async fn dispatch_request(
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,
-        processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
-        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestTrailers(_) => handle_trailers(pipeline, state, true).await,
+        processing_request::Request::ResponseTrailers(_) => handle_trailers(pipeline, state, false).await,
     }
 }
 
@@ -535,15 +535,23 @@ impl EosTracker {
         }
 
         if received_eos {
-            match phase {
-                ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
-                ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
-                ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
-                ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
-            }
+            self.mark_complete(phase);
         }
 
         Ok(PhaseState::Active)
+    }
+
+    /// Force a phase to [`PhaseState::Completed`].
+    ///
+    /// Used when trailers, rather than an `end_of_stream` flag, close a body
+    /// phase.
+    fn mark_complete(&mut self, phase: ProtocolPhase) {
+        match phase {
+            ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
+            ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
+            ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
+            ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
+        }
     }
 }
 
@@ -557,6 +565,11 @@ fn duplicate_after_eos(phase: ProtocolPhase) -> Status {
     Status::invalid_argument(format!(
         "received {phase:?} message after end_of_stream was already marked"
     ))
+}
+
+/// Direction label for diagnostics.
+const fn direction_label(is_request: bool) -> &'static str {
+    if is_request { "request" } else { "response" }
 }
 
 /// Apply body-phase policy to the phase state observed by [`EosTracker::check_and_mark`].
@@ -651,7 +664,7 @@ async fn handle_request_body(
     }
 }
 
-/// Accumulate request body chunks, run full pipeline on EOS.
+/// Accumulate request body chunks, run full pipeline once the body is complete.
 async fn accumulate_request_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
@@ -743,7 +756,7 @@ async fn handle_response_body(
     }
 }
 
-/// Accumulate response body chunks, run full pipeline on EOS.
+/// Accumulate response body chunks, run full pipeline once the body is complete.
 async fn accumulate_response_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
@@ -757,6 +770,160 @@ async fn accumulate_response_body(
     }
 
     run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+}
+
+// -----------------------------------------------------------------------------
+// Trailers
+// -----------------------------------------------------------------------------
+
+/// Handle trailers for one direction: release any held-back body work, then
+/// acknowledge with a `TrailersResponse`.
+async fn handle_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = finalize_body_on_trailers(pipeline, state, is_request).await?;
+    // Envoy ignores everything after an immediate response, so skip the ack then.
+    if !responses.last().is_some_and(response::is_immediate) {
+        responses.push(if is_request {
+            response::request_trailers()
+        } else {
+            response::response_trailers()
+        });
+    }
+    Ok(responses)
+}
+
+/// Complete a body phase that trailers, not `end_of_stream`, close.
+///
+/// Envoy signals the end of a body carrying trailers with the trailers message
+/// itself. Work held back for end-of-stream — the accumulated `BUFFERED` body or
+/// a `STREAMED` filter's end-of-stream call — must run now or the stream stalls.
+async fn finalize_body_on_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if !state.body_open(is_request) {
+        return Ok(Vec::new());
+    }
+
+    let (phase, mode, needs_body) = trailing_body_phase(pipeline, state, is_request);
+    state.eos_tracker.mark_complete(phase);
+
+    match mode {
+        BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
+        // A BUFFERED body that never arrived (empty) still needs its pipeline run,
+        // but there is no body message to carry header/body mutations; only an
+        // immediate (rejection) applies.
+        BodyMode::Buffered => {
+            let responses = if is_request {
+                run_request_pipeline(RequestPhase::Body, pipeline, state).await?
+            } else {
+                run_response_pipeline(ResponsePhase::Body, pipeline, state).await?
+            };
+            Ok(rejection_only(responses, is_request))
+        },
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the body phase, configured body mode, and body need for one direction.
+fn trailing_body_phase(
+    pipeline: &FilterPipeline,
+    state: &StreamState,
+    is_request: bool,
+) -> (ProtocolPhase, BodyMode, bool) {
+    let caps = pipeline.body_capabilities();
+    if is_request {
+        (
+            ProtocolPhase::RequestBody,
+            state.protocol_config.request_body_mode,
+            caps.needs_request_body,
+        )
+    } else {
+        (
+            ProtocolPhase::ResponseBody,
+            state.protocol_config.response_body_mode,
+            caps.needs_response_body,
+        )
+    }
+}
+
+/// Give STREAMED body filters their end-of-stream call when trailers close the
+/// body.
+///
+/// Every chunk was answered as it arrived but none carried `end_of_stream`, so
+/// filters that finish at end of stream (access logging, token accounting) would
+/// otherwise never run it. Run the body filters once more with no data and the
+/// flag set; any body bytes they produce have no message to ride on, but a
+/// rejection still applies.
+async fn flush_streamed_body_filters(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state.request.as_ref().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "request");
+        Status::invalid_argument("request headers not received")
+    })?;
+    let mut ctx = adapter::build_filter_context(pipeline, request);
+    state.restore_request_ctx(&mut ctx);
+    ctx.filter_state = mem::take(&mut state.filter_state);
+
+    let action = run_trailing_body(pipeline, &mut ctx, state.response.as_mut(), is_request).await?;
+
+    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.filter_state = mem::take(&mut ctx.filter_state);
+    Ok(immediate_from_action(action)
+        .map(response::immediate)
+        .into_iter()
+        .collect())
+}
+
+/// Run body filters once with `end_of_stream` set and no data, warning if they
+/// emit bytes that no message can carry.
+async fn run_trailing_body<'a>(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'a>,
+    response: Option<&'a mut Response>,
+    is_request: bool,
+) -> Result<FilterAction, Status> {
+    let mut body = None;
+    let action = if is_request {
+        pipeline.execute_http_request_body(ctx, &mut body, true).await
+    } else {
+        ctx.response_header = response;
+        pipeline.execute_http_response_body(ctx, &mut body, true)
+    }
+    .map_err(|e| Status::internal(e.to_string()))?;
+
+    if body.as_ref().is_some_and(|b| !b.is_empty()) {
+        warn!(
+            direction = direction_label(is_request),
+            "body filters produced bytes at end of stream after trailers; no message can carry them"
+        );
+    }
+    Ok(action)
+}
+
+/// Keep only an `ImmediateResponse` from a pipeline run that had no body message
+/// to answer.
+///
+/// A BUFFERED body that turns out to be empty never produces a body message, so
+/// header and body mutations have nothing to ride on; a rejection still applies.
+fn rejection_only(responses: Vec<ProcessingResponse>, is_request: bool) -> Vec<ProcessingResponse> {
+    let immediate: Vec<ProcessingResponse> = responses.into_iter().filter(response::is_immediate).collect();
+    if immediate.is_empty() {
+        warn!(
+            direction = direction_label(is_request),
+            "trailers closed an empty BUFFERED body; pipeline header mutations have no message to apply to and are dropped"
+        );
+    }
+    immediate
 }
 
 // -----------------------------------------------------------------------------
@@ -787,7 +954,7 @@ async fn run_request_pipeline(
     let mut ctx = adapter::build_filter_context(pipeline, request);
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -902,7 +1069,7 @@ async fn execute_response_pipeline_and_body_filters(
 
     if should_execute {
         let action = execute_response(pipeline, ctx).await?;
-        if let Some(imm) = check_reject(action) {
+        if let Some(imm) = immediate_from_action(action) {
             return Ok(Some(imm));
         }
     }
@@ -1137,7 +1304,7 @@ async fn run_request_header_filters_early(
     let mut ctx = adapter::build_filter_context(pipeline, request);
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -1172,7 +1339,7 @@ async fn run_response_header_filters_early(
     ctx.response_header = Some(resp);
 
     let action = execute_response(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -1208,13 +1375,23 @@ async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext
         .map_err(|e| Status::internal(e.to_string()))
 }
 
-/// Convert a [`FilterAction::Reject`] into an `ImmediateResponse`.
-fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
-    if let FilterAction::Reject(rejection) = action {
-        metrics::record_immediate_response();
-        Some(adapter::rejection_to_immediate(&rejection))
-    } else {
-        None
+/// Convert a short-circuiting [`FilterAction`] into an `ImmediateResponse`.
+///
+/// Both `Reject` and `TerminalResponse` end the stream with a local reply at
+/// Envoy; every other action means the pipeline continues.
+fn immediate_from_action(
+    action: FilterAction,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+    match action {
+        FilterAction::Reject(rejection) => {
+            metrics::record_immediate_response();
+            Some(adapter::rejection_to_immediate(rejection))
+        },
+        FilterAction::TerminalResponse(terminal) => {
+            metrics::record_immediate_response();
+            Some(adapter::terminal_response_to_immediate(*terminal))
+        },
+        _ => None,
     }
 }
 
@@ -1244,7 +1421,7 @@ async fn run_body_filters(
     }
 
     if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
+        return Ok(Some(adapter::rejection_to_immediate(rejection)));
     }
 
     Ok(None)
@@ -1271,7 +1448,7 @@ fn run_resp_body_filters(
     }
 
     if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
+        return Ok(Some(adapter::rejection_to_immediate(rejection)));
     }
 
     Ok(None)
@@ -1381,6 +1558,30 @@ impl StreamState {
         ctx.branch_iterations.clone_from(&self.branch_iterations);
         ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
+
+    /// Whether a direction's body phase is still open — headers were received but
+    /// neither the headers nor the body phase has run the pipeline yet.
+    ///
+    /// True only when trailers, not a body message, will close the body: the
+    /// pipeline has held back its work and must be released now.
+    fn body_open(&self, is_request: bool) -> bool {
+        let (present, headers, body) = if is_request {
+            (
+                self.request.is_some(),
+                ProtocolPhase::RequestHeaders,
+                ProtocolPhase::RequestBody,
+            )
+        } else {
+            (
+                self.response.is_some(),
+                ProtocolPhase::ResponseHeaders,
+                ProtocolPhase::ResponseBody,
+            )
+        };
+        present
+            && !self.eos_tracker.phase_state(headers).is_complete()
+            && !self.eos_tracker.phase_state(body).is_complete()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1459,6 +1660,28 @@ mod tests {
         let state = PhaseState::default();
         assert_eq!(state, PhaseState::Active, "default phase state should be Active");
         assert!(!state.is_complete(), "default phase state should not be complete");
+    }
+
+    #[test]
+    fn immediate_from_action_converts_terminal_response() {
+        let terminal = praxis_filter::TerminalResponse::new(200).with_body(Bytes::from_static(b"done"));
+        let imm = immediate_from_action(FilterAction::TerminalResponse(Box::new(terminal))).unwrap();
+        assert_eq!(imm.status.unwrap().code, 200, "terminal status carried through");
+        assert_eq!(imm.body, "done", "terminal body carried through");
+    }
+
+    #[test]
+    fn immediate_from_action_converts_reject() {
+        let imm = immediate_from_action(FilterAction::Reject(praxis_filter::Rejection::status(403))).unwrap();
+        assert_eq!(imm.status.unwrap().code, 403, "reject status carried through");
+    }
+
+    #[test]
+    fn immediate_from_action_passes_through_continue() {
+        assert!(
+            immediate_from_action(FilterAction::Continue).is_none(),
+            "Continue must not short-circuit"
+        );
     }
 
     #[test]
