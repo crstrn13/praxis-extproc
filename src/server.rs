@@ -356,14 +356,15 @@ pub(crate) struct CarriedContext {
 
 /// A context holding hydrated cross-phase state.
 ///
-/// Owning the context between hydrate and dehydrate means there is no bare
-/// context to capture out of by mistake; deref exposes it as a plain
-/// [`HttpFilterContext`] so filter code is unchanged. Consuming `self` in
-/// [`HydratedContext::dehydrate`] makes a second capture a compile error.
+/// [`HydratedContext::hydrate`] is the only constructor and the `ctx` field is
+/// private, so there is no bare context to capture out of by mistake. Deref
+/// exposes it as a plain [`HttpFilterContext`] so filter code is unchanged, and
+/// consuming `self` in [`HydratedContext::dehydrate`] makes a second capture a
+/// compile error.
 #[must_use = "a hydrated context must be dehydrated back into CarriedContext"]
 pub(crate) struct HydratedContext<'a> {
     /// The context holding hydrated cross-phase state.
-    pub(crate) ctx: HttpFilterContext<'a>,
+    ctx: HttpFilterContext<'a>,
 }
 
 impl<'a> HydratedContext<'a> {

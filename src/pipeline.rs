@@ -1102,15 +1102,19 @@ mod tests {
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
 
-        // Populate every carried field with a distinct sentinel.
-        let mut ctx = adapter::build_filter_context(&pipeline, &request);
-        ctx.branch_iterations.insert(Arc::from("branch-a"), 3);
-        ctx.executed_filter_indices = vec![true, false, true];
-        ctx.filter_metadata.insert("carry.meta".to_owned(), "kept".to_owned());
-        ctx.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+        // Seed every carried field on a hydrated context, the way a filter would
+        // (through DerefMut), so `hydrate` stays the only way to build one.
+        let ctx = adapter::build_filter_context(&pipeline, &request);
+        let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
+        hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
+        hydrated.executed_filter_indices = vec![true, false, true];
+        hydrated
+            .filter_metadata
+            .insert("carry.meta".to_owned(), "kept".to_owned());
+        hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
 
         // Capture (`dehydrate`) must move every field out of the hydrated context.
-        let carried = HydratedContext { ctx }.dehydrate();
+        let carried = hydrated.dehydrate();
 
         // Enumerate every carried field: a new field on `CarriedContext` fails to
         // compile here until it is asserted.
