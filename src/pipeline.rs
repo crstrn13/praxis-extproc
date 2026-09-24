@@ -65,7 +65,7 @@ pub(crate) async fn run_request_pipeline(
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
 
-    state.carried_context = Some(ctx.dehydrate());
+    ctx.dehydrate(&mut state.carried_context)?;
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
@@ -128,7 +128,7 @@ pub(crate) async fn run_response_pipeline(
     }
 
     let current_mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
-    state.carried_context = Some(ctx.dehydrate());
+    ctx.dehydrate(&mut state.carried_context)?;
 
     let mutation = match phase {
         ResponsePhase::Headers => current_mutation,
@@ -317,7 +317,7 @@ pub(crate) async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
-    state.carried_context = Some(ctx.dehydrate());
+    ctx.dehydrate(&mut state.carried_context)?;
     let (mutation, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
@@ -409,7 +409,7 @@ pub(crate) async fn run_request_header_filters_early(
     }
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
-    state.carried_context = Some(ctx.dehydrate());
+    ctx.dehydrate(&mut state.carried_context)?;
 
     Ok(delivery.deliver_request(mutation, state))
 }
@@ -442,7 +442,7 @@ pub(crate) async fn run_response_header_filters_early(
 
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
-    state.carried_context = Some(ctx.dehydrate());
+    ctx.dehydrate(&mut state.carried_context)?;
 
     Ok(delivery.deliver_response(mutation, state))
 }
@@ -1147,6 +1147,10 @@ mod tests {
     }
 
     /// Completeness guard: every carried field survives a round trip.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one guard enumerates every carried field across hydrate and dehydrate"
+    )]
     #[test]
     fn carried_state_round_trips_every_field() {
         use crate::server::CarriedContext;
@@ -1165,8 +1169,10 @@ mod tests {
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
 
-        // Capture (`dehydrate`) must move every field out of the hydrated context.
-        let carried = hydrated.dehydrate();
+        // Capture (`dehydrate`) must move every field into the empty slot.
+        let mut slot = None;
+        hydrated.dehydrate(&mut slot).unwrap();
+        let carried = slot.take().unwrap();
 
         // Enumerate every carried field: a new field on `CarriedContext` fails to
         // compile here until it is asserted.
@@ -1232,6 +1238,37 @@ mod tests {
         assert!(
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
             "a second hydrate from a drained slot must report an internal error"
+        );
+    }
+
+    /// Dehydrating into a slot that still holds parked state means a prior phase
+    /// never drained it: dehydrate must surface it as an error instead of
+    /// silently overwriting the parked context.
+    #[test]
+    fn dehydrate_reports_occupied_slot() {
+        use crate::server::CarriedContext;
+
+        let pipeline = carry_probe_pipeline();
+        let request = adapter::envoy_headers_to_request(&[]);
+        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
+
+        // The slot is still occupied: a prior phase failed to drain it.
+        let mut slot = Some(CarriedContext::default());
+        slot.as_mut()
+            .unwrap()
+            .filter_metadata
+            .insert("kept".to_owned(), "yes".to_owned());
+
+        let result = hydrated.dehydrate(&mut slot);
+        assert!(
+            matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
+            "dehydrate into an occupied slot must report an internal error"
+        );
+        assert_eq!(
+            slot.as_ref().unwrap().filter_metadata.get("kept").map(String::as_str),
+            Some("yes"),
+            "a rejected dehydrate must not overwrite the parked context"
         );
     }
 }

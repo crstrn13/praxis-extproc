@@ -384,15 +384,31 @@ impl<'a> HydratedContext<'a> {
         Ok(Self { ctx })
     }
 
-    /// Capture cross-phase state back out at phase end, consuming the hydrated
-    /// context so it cannot be captured twice.
-    pub(crate) fn dehydrate(self) -> CarriedContext {
-        CarriedContext {
+    /// Capture cross-phase state back into `slot` at phase end, consuming the
+    /// hydrated context so it cannot be captured twice. The slot must be empty:
+    /// [`hydrate`] drained it at phase start, so a `Some` slot means a prior
+    /// write-back was never drained. That surfaces as an error rather than
+    /// silently overwriting parked state.
+    ///
+    /// Takes the [`StreamState::carried_context`] slot rather than `&mut
+    /// StreamState`: the hydrated context still borrows `state.request` /
+    /// `state.response`, so only a disjoint-field borrow of the slot is
+    /// available at the call site.
+    ///
+    /// [`hydrate`]: HydratedContext::hydrate
+    pub(crate) fn dehydrate(self, slot: &mut Option<CarriedContext>) -> Result<(), Status> {
+        if slot.is_some() {
+            return Err(Status::internal(
+                "cross-phase context already present: this phase did not drain it before capture",
+            ));
+        }
+        *slot = Some(CarriedContext {
             branch_iterations: self.ctx.branch_iterations,
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
-        }
+        });
+        Ok(())
     }
 }
 
