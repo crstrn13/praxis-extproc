@@ -330,20 +330,93 @@ impl HeaderDeliveryState {
     }
 }
 
-/// Per-stream state accumulated across ExtProc phases.
+/// Cross-phase filter-context state parked between ExtProc phases.
+///
+/// A fresh [`HttpFilterContext`] is built per phase, so these fields cross the
+/// boundary as two linear moves: [`HydratedContext::hydrate`] pours the parked state
+/// into a fresh context at phase start, and [`HydratedContext::dehydrate`] captures it
+/// back out at phase end. The stream state parks this in an `Option` slot moved out
+/// to hydrate each phase's context and moved back on capture: a phase that forgets to
+/// restore its state leaves the slot `None`, which the next `hydrate` reports as an
+/// error instead of silently carrying an empty context. `#[must_use]` flags parked
+/// state that is dropped instead of hydrated.
+#[must_use = "parked cross-phase state must be hydrated into a context"]
 #[derive(Debug, Default)]
-pub(crate) struct StreamState {
-    /// Re-entrance counters from request-phase branch chains.
+pub(crate) struct CarriedContext {
+    /// Branch re-entrance counters.
     pub(crate) branch_iterations: HashMap<Arc<str>, u32>,
 
-    /// Executed filter indices from request phase.
+    /// Filter indices executed in earlier phases.
     pub(crate) executed_filter_indices: Vec<bool>,
 
-    /// Metadata carried from request to response phase.
+    /// Flat string metadata.
     pub(crate) filter_metadata: HashMap<String, String>,
 
-    /// Typed per-filter state carried from request to response phase.
+    /// Typed per-filter state.
     pub(crate) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+}
+
+/// A context holding hydrated cross-phase state.
+///
+/// Owning the context between hydrate and dehydrate means there is no bare
+/// context to capture out of by mistake; deref exposes it as a plain
+/// [`HttpFilterContext`] so filter code is unchanged. Consuming `self` in
+/// [`HydratedContext::dehydrate`] makes a second capture a compile error.
+#[must_use = "a hydrated context must be dehydrated back into CarriedContext"]
+pub(crate) struct HydratedContext<'a> {
+    /// The context holding hydrated cross-phase state.
+    pub(crate) ctx: HttpFilterContext<'a>,
+}
+
+impl<'a> HydratedContext<'a> {
+    /// Pour parked state into a fresh context at phase start. A `None` argument
+    /// means a prior phase never restored its state, so it surfaces as an error
+    /// rather than silently hydrating an empty context. Owning the context by value
+    /// means the bare context is consumed, so it cannot be hydrated a second time.
+    pub(crate) fn hydrate(carried: Option<CarriedContext>, mut ctx: HttpFilterContext<'a>) -> Result<Self, Status> {
+        let carried =
+            carried.ok_or_else(|| Status::internal("cross-phase context missing: a prior phase did not restore it"))?;
+        ctx.branch_iterations = carried.branch_iterations;
+        ctx.executed_filter_indices = carried.executed_filter_indices;
+        ctx.filter_metadata = carried.filter_metadata;
+        ctx.filter_state = carried.filter_state;
+        Ok(Self { ctx })
+    }
+
+    /// Capture cross-phase state back out at phase end, consuming the hydrated
+    /// context so it cannot be captured twice.
+    pub(crate) fn dehydrate(self) -> CarriedContext {
+        CarriedContext {
+            branch_iterations: self.ctx.branch_iterations,
+            executed_filter_indices: self.ctx.executed_filter_indices,
+            filter_metadata: self.ctx.filter_metadata,
+            filter_state: self.ctx.filter_state,
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for HydratedContext<'a> {
+    type Target = HttpFilterContext<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+impl std::ops::DerefMut for HydratedContext<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ctx
+    }
+}
+
+/// Per-stream state accumulated across ExtProc phases.
+#[derive(Debug)]
+pub(crate) struct StreamState {
+    /// Filter-context state carried across phase boundaries.
+    ///
+    /// Moved out to hydrate each phase's context and refilled on capture; a `None`
+    /// between phases means a phase failed to restore its state.
+    pub(crate) carried_context: Option<CarriedContext>,
 
     /// Converted request from the headers phase.
     pub(crate) request: Option<Request>,
@@ -379,6 +452,28 @@ pub(crate) struct StreamState {
     pub(crate) max_body_accumulation: Option<usize>,
 }
 
+impl Default for StreamState {
+    /// The carried-context slot is seeded present, not `None`: `None` is reserved
+    /// for a slot a phase drained without restoring, so both constructors must start
+    /// it as `Some` to keep that signal meaningful.
+    fn default() -> Self {
+        Self {
+            carried_context: Some(CarriedContext::default()),
+            request: None,
+            request_body: Vec::new(),
+            response: None,
+            response_body: Vec::new(),
+            header_state: HeaderDeliveryState::default(),
+            eos_tracker: EosTracker::default(),
+            protocol_config: ProtocolConfig::default(),
+            deferred_request_header_mutation: None,
+            deferred_response_header_mutation: None,
+            phase_order: PhaseOrderTracker::default(),
+            max_body_accumulation: None,
+        }
+    }
+}
+
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
     ///
@@ -387,17 +482,9 @@ impl StreamState {
     /// it with the configured effective limit.
     pub(crate) fn new() -> Self {
         Self {
-            protocol_config: ProtocolConfig::default(),
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
         }
-    }
-
-    /// Restore filter execution state into a response context.
-    pub(crate) fn restore_request_ctx(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
-        ctx.branch_iterations.clone_from(&self.branch_iterations);
-        ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
 }
 
