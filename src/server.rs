@@ -340,18 +340,18 @@ impl HeaderDeliveryState {
 /// state that is dropped instead of hydrated.
 #[must_use = "parked cross-phase state must be hydrated into a context"]
 #[derive(Debug, Default)]
-pub(crate) struct CarriedContext {
+pub(super) struct CarriedContext {
     /// Branch re-entrance counters.
-    pub(crate) branch_iterations: HashMap<Arc<str>, u32>,
+    pub(super) branch_iterations: HashMap<Arc<str>, u32>,
 
     /// Filter indices executed in earlier phases.
-    pub(crate) executed_filter_indices: Vec<bool>,
+    pub(super) executed_filter_indices: Vec<bool>,
 
     /// Flat string metadata.
-    pub(crate) filter_metadata: HashMap<String, String>,
+    pub(super) filter_metadata: HashMap<String, String>,
 
     /// Typed per-filter state.
-    pub(crate) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+    pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// A context holding hydrated cross-phase state.
@@ -362,7 +362,7 @@ pub(crate) struct CarriedContext {
 /// consuming `self` in [`HydratedContext::dehydrate`] makes a second capture a
 /// compile error.
 #[must_use = "a hydrated context must be dehydrated back into CarriedContext"]
-pub(crate) struct HydratedContext<'a> {
+pub(super) struct HydratedContext<'a> {
     /// The context holding hydrated cross-phase state.
     ctx: HttpFilterContext<'a>,
 }
@@ -372,7 +372,7 @@ impl<'a> HydratedContext<'a> {
     /// means a prior phase never restored its state, so it surfaces as an error
     /// rather than silently hydrating an empty context. Owning the context by value
     /// means the bare context is consumed, so it cannot be hydrated a second time.
-    pub(crate) fn hydrate(carried: Option<CarriedContext>, mut ctx: HttpFilterContext<'a>) -> Result<Self, Status> {
+    pub(super) fn hydrate(carried: Option<CarriedContext>, mut ctx: HttpFilterContext<'a>) -> Result<Self, Status> {
         let carried =
             carried.ok_or_else(|| Status::internal("cross-phase context missing: a prior phase did not restore it"))?;
         ctx.branch_iterations = carried.branch_iterations;
@@ -394,7 +394,7 @@ impl<'a> HydratedContext<'a> {
     /// available at the call site.
     ///
     /// [`hydrate`]: HydratedContext::hydrate
-    pub(crate) fn dehydrate(self, slot: &mut Option<CarriedContext>) -> Result<(), Status> {
+    pub(super) fn dehydrate(self, slot: &mut Option<CarriedContext>) -> Result<(), Status> {
         if slot.is_some() {
             return Err(Status::internal(
                 "cross-phase context already present: this phase did not drain it before capture",
