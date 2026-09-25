@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::error::{ExtProcError, Result};
 
 // -----------------------------------------------------------------------------
-// ExtProcConfig
+// ExtProc Server
 // -----------------------------------------------------------------------------
 
 /// Top-level ExtProc server configuration.
@@ -79,6 +79,15 @@ pub struct ServerConfig {
     /// Defaults to [`DrainTimeoutSecs::default`]; must be greater than zero.
     #[serde(default)]
     pub shutdown_drain_timeout_secs: DrainTimeoutSecs,
+
+    /// Maximum accumulated request/response body size, in bytes, before a
+    /// stream is rejected with `RESOURCE_EXHAUSTED`.
+    ///
+    /// Defaults to [`DEFAULT_MAX_BODY_BYTES`]. Ignored when
+    /// `insecure_options.allow_unbounded_body` is set, which lifts the cap
+    /// entirely.
+    #[serde(default)]
+    pub max_body_bytes: MaxBodyBytes,
 }
 
 impl Default for ServerConfig {
@@ -89,6 +98,7 @@ impl Default for ServerConfig {
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
             shutdown_drain_timeout_secs: DrainTimeoutSecs::default(),
+            max_body_bytes: MaxBodyBytes::default(),
         }
     }
 }
@@ -133,6 +143,64 @@ impl TryFrom<u64> for DrainTimeoutSecs {
     }
 }
 
+/// Default maximum accumulated body size (10 MiB) before rejecting a stream.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum accumulated request/response body size in bytes, guaranteed non-zero
+/// at parse time.
+///
+/// Constrained numeric parsed via `#[serde(try_from = "usize")]`, so a zero
+/// value is rejected during deserialization rather than at a later validation
+/// step. Superseded by `insecure_options.allow_unbounded_body`, which removes
+/// the cap entirely; see [`ExtProcConfig::max_body_accumulation`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "usize")]
+pub struct MaxBodyBytes(std::num::NonZeroUsize);
+
+impl MaxBodyBytes {
+    /// The configured ceiling, in bytes.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for MaxBodyBytes {
+    /// 10 MiB, matching the historical fixed accumulation cap.
+    fn default() -> Self {
+        // DEFAULT_MAX_BODY_BYTES is non-zero, so the fallback arm is never taken.
+        Self(match std::num::NonZeroUsize::new(DEFAULT_MAX_BODY_BYTES) {
+            Some(v) => v,
+            None => std::num::NonZeroUsize::MIN,
+        })
+    }
+}
+
+impl TryFrom<usize> for MaxBodyBytes {
+    type Error = &'static str;
+
+    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+        std::num::NonZeroUsize::new(value)
+            .map(Self)
+            .ok_or("max_body_bytes must be greater than zero")
+    }
+}
+
+impl ExtProcConfig {
+    /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
+    ///
+    /// Returns `None` when `insecure_options.allow_unbounded_body` is set,
+    /// otherwise the configured [`ServerConfig::max_body_bytes`].
+    #[must_use]
+    pub fn max_body_accumulation(&self) -> Option<usize> {
+        if self.insecure_options.allow_unbounded_body {
+            None
+        } else {
+            Some(self.server.max_body_bytes.get())
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Pipeline Construction
 // -----------------------------------------------------------------------------
@@ -158,7 +226,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
 
     let mut entries = flatten_chains(&config.filter_chains);
 
-    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)
+    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline
@@ -166,6 +234,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+    #[cfg(feature = "responses-store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
     Ok(Arc::new(pipeline))
@@ -292,6 +361,79 @@ server:
     }
 
     #[test]
+    fn max_body_bytes_defaults() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(
+            cfg.server.max_body_bytes.get(),
+            DEFAULT_MAX_BODY_BYTES,
+            "max_body_bytes should default to 10 MiB"
+        );
+        assert_eq!(
+            cfg.max_body_accumulation(),
+            Some(DEFAULT_MAX_BODY_BYTES),
+            "effective limit should be the default when bounded"
+        );
+    }
+
+    #[test]
+    fn parse_custom_max_body_bytes() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  max_body_bytes: 52428800
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.server.max_body_bytes.get(),
+            52_428_800,
+            "max_body_bytes should match"
+        );
+        assert_eq!(
+            cfg.max_body_accumulation(),
+            Some(52_428_800),
+            "effective limit should reflect the configured ceiling"
+        );
+    }
+
+    #[test]
+    fn zero_max_body_bytes_rejected() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+server:
+  max_body_bytes: 0
+"#,
+        );
+
+        let err = result.expect_err("zero max_body_bytes should be rejected at parse time");
+        assert!(
+            err.to_string().contains("max_body_bytes"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_unbounded_body_disables_accumulation_limit() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+insecure_options:
+  allow_unbounded_body: true
+server:
+  max_body_bytes: 1024
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.max_body_accumulation(),
+            None,
+            "allow_unbounded_body should lift the accumulation cap"
+        );
+    }
+
+    #[test]
     fn build_pipeline_with_builtins() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
@@ -409,5 +551,22 @@ bogus_key: true
         );
 
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn empty_filter_chain_builds_empty_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: empty
+    filters: []
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert_eq!(pipeline.len(), 0, "empty chain should produce empty pipeline");
     }
 }

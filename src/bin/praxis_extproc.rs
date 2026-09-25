@@ -70,11 +70,16 @@ async fn main() {
 
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Before anything that builds a filter registry, a subrequest client or a
+    // TLS configuration: the provider installed here is the only one there is.
+    let fips = praxis_extproc::fips::install()?;
+
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
+        fips.require()?;
         pipeline?;
         info!("configuration is valid");
         return Ok(());
@@ -82,14 +87,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
-    // The `fips` feature makes approved-mode a hard requirement at compile time.
-    // Whether the host is in approved mode is probed at runtime.
-    let fips = praxis_extproc::fips::assess();
-    if !fips.serve_ok {
-        return Box::pin(serve_unready(addrs, fips.active)).await;
+    // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
+    // whether it is in effect; when it is not, the process stays up and
+    // inspectable (health NotServing) but serves no traffic.
+    if let Err(e) = fips.require() {
+        error!(error = %e, "refusing to serve");
+        return Box::pin(serve_unready(addrs, fips.active())).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server, fips.active)).await
+    Box::pin(serve_pipeline(
+        addrs,
+        pipeline,
+        &cfg.server,
+        cfg.max_body_accumulation(),
+        fips.active(),
+    ))
+    .await
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
@@ -97,6 +110,7 @@ async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -106,7 +120,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, max_body, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -120,17 +134,18 @@ async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, drain_rx)
+        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
     }))
     .await
 }
 
 /// Serve only health (`NotServing`) and metrics when the pipeline failed to
-/// build or the FIPS gate refused, keeping the process alive and inspectable
-/// until shutdown.
+/// build or FIPS mode is required and not in effect, keeping the process
+/// alive and inspectable until shutdown.
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,
@@ -240,12 +255,17 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The latch fires when the drain deadline expires, forcing any streams still
     // running after graceful shutdown began to cancel.
     let (force_tx, force_rx) = tokio::sync::watch::channel(false);
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline).with_force_shutdown(force_rx.clone()));
+    let svc = ExternalProcessorServer::new(
+        PraxisExtProc::new(pipeline)
+            .with_max_body_accumulation(max_body)
+            .with_force_shutdown(force_rx.clone()),
+    );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
     let controls = ShutdownControls {
         signal: Box::pin(shutdown_with_deadline(drain_rx, force_tx, drain)),

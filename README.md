@@ -22,6 +22,7 @@ start deploying alongside Envoy.
 - [Architecture](docs/architecture.md): how the ExtProc server works
 - [Configuration](docs/configuration.md): YAML reference for filter chains, server, and TLS
 - [IPP → Praxis Migration](docs/migration-ipp-to-praxis.md): moving from the Go Inference Payload Processor
+- [FIPS](docs/fips.md): the image is the FIPS build; what it leaves out, host prerequisites, `PRAXIS_REQUIRE_FIPS`
 - [Development](docs/development.md): building, testing, contributing
 - [Conventions](docs/conventions.md): coding standards
 
@@ -34,9 +35,7 @@ yourself with the following documentation first:
 - [Conventions](docs/conventions.md)
 - [Development](docs/development.md)
 
-For larger changes, open a [discussion] and follow
-the [proposal process](docs/proposals.md).
+For larger changes create an issue and discuss it with us first.
 
 [Issues]: https://github.com/opendatahub-io/praxis-extproc/issues/new
 [pull requests]: https://github.com/opendatahub-io/praxis-extproc/compare
-[discussion]: https://github.com/opendatahub-io/praxis-extproc/discussions
