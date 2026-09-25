@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::error::{ExtProcError, Result};
 
 // -----------------------------------------------------------------------------
-// ExtProcConfig
+// ExtProc Server
 // -----------------------------------------------------------------------------
 
 /// Top-level ExtProc server configuration.
@@ -226,7 +226,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
 
     let mut entries = flatten_chains(&config.filter_chains);
 
-    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)
+    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline
@@ -234,6 +234,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+    #[cfg(feature = "responses-store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
     Ok(Arc::new(pipeline))
@@ -550,5 +551,22 @@ bogus_key: true
         );
 
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn empty_filter_chain_builds_empty_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: empty
+    filters: []
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert_eq!(pipeline.len(), 0, "empty chain should produce empty pipeline");
     }
 }
