@@ -10,9 +10,10 @@
 //!
 //! [`FilterPipeline`]: praxis_filter::FilterPipeline
 
-use std::{collections::HashMap, mem};
+use std::mem;
 
 use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
 use praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse;
 use tonic::Status;
@@ -448,12 +449,9 @@ pub(crate) async fn run_response_header_filters_early(
     Ok(delivery.deliver_response(mutation, state))
 }
 
-/// Capture response header names and values before filter execution.
-fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
-    resp.headers
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
-        .collect()
+/// Capture response headers before filter execution.
+fn capture_original_headers(resp: &Response) -> HeaderMap {
+    resp.headers.clone()
 }
 
 /// Execute the request-phase pipeline.
@@ -482,11 +480,11 @@ fn immediate_from_action(
     match action {
         FilterAction::Reject(rejection) => {
             metrics::record_immediate_response();
-            Some(adapter::rejection_to_immediate(rejection))
+            Some(adapter::rejection_to_immediate(&rejection))
         },
         FilterAction::TerminalResponse(terminal) => {
             metrics::record_immediate_response();
-            Some(adapter::terminal_response_to_immediate(*terminal))
+            Some(adapter::terminal_response_to_immediate(&terminal))
         },
         _ => None,
     }
@@ -518,7 +516,7 @@ async fn run_body_filters(
     }
 
     if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(rejection)));
+        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
     }
 
     Ok(None)
@@ -545,7 +543,7 @@ fn run_resp_body_filters(
     }
 
     if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(rejection)));
+        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
     }
 
     Ok(None)
