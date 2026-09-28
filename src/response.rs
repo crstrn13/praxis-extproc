@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_request_body_header_mutation_clears_route_cache() {
+    fn full_duplex_request_body_header_mutation_clears_route_cache() {
         let mutation = HeaderMutation {
             set_headers: vec![],
             remove_headers: vec!["x-internal".to_owned()],
@@ -866,7 +866,7 @@ mod tests {
 
         assert!(
             extract_clear_route_cache(&responses[0]),
-            "streamed request body with header mutation must clear the route cache on the first chunk"
+            "full-duplex request body with header mutation must clear the route cache on the first chunk"
         );
     }
 

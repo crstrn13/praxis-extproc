@@ -14,7 +14,7 @@ use std::{collections::HashMap, mem};
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
-use praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse;
+use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingResponse};
 use tonic::Status;
 use tracing::warn;
 
@@ -185,10 +185,10 @@ async fn execute_response_pipeline_and_body_filters(
 /// `allow_content_length_header`; ignored (harmlessly) in `STREAMED`, where Envoy
 /// strips content-length and switches to chunked encoding.
 fn with_content_length(
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     original_len: usize,
-) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+) -> Option<HeaderMutation> {
     match body {
         Some(b) if b.len() != original_len => Some(adapter::set_content_length(mutation, b.len())),
         _ => mutation,
@@ -198,7 +198,7 @@ fn with_content_length(
 /// Build request-phase responses, prepending `HeadersResponse` in FDS mode.
 fn build_request_for_phase(
     phase: RequestPhase,
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
 ) -> Vec<ProcessingResponse> {
@@ -217,7 +217,7 @@ fn build_request_for_phase(
 /// Build response-phase responses, prepending `ResponseHeadersResponse` in FDS mode.
 fn build_response_for_phase(
     phase: ResponsePhase,
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
 ) -> Vec<ProcessingResponse> {
@@ -322,7 +322,6 @@ pub(crate) async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
-    warn_unapplied_header_mutations(&ctx, is_request, original_response_headers.as_ref());
     let current_mutation = if is_request {
         adapter::collect_request_header_mutations(&ctx)
     } else {
@@ -330,25 +329,23 @@ pub(crate) async fn process_streamed_body_chunk(
             .as_ref()
             .and_then(|original| adapter::collect_response_header_mutations_diff(&ctx, original))
     };
+    warn_unapplied_header_mutations(is_request, current_mutation.as_ref());
     ctx.dehydrate(&mut state.carried_context)?;
-    let (deferred, body_mode) = if is_request {
-        (
-            state.deferred_request_header_mutation.take(),
-            state.protocol_config.request_body_mode,
-        )
+    let body_mode = if is_request {
+        state.protocol_config.request_body_mode
     } else {
-        (
-            state.deferred_response_header_mutation.take(),
-            state.protocol_config.response_body_mode,
-        )
+        state.protocol_config.response_body_mode
     };
-    let mutation = merge_mutations(deferred, current_mutation);
 
+    // STREAMED forwards the chunk but never the body-derived header mutation:
+    // Envoy already sent the headers upstream, so it drops any mutation on a body
+    // message. The warning above is the operator's only signal; switch the
+    // direction to BUFFERED or full-duplex to apply body-derived headers.
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
-        response::request_body(body_data, mutation, body_mode, eos)
+        response::request_body(body_data, None, body_mode, eos)
     } else {
-        response::response_body(body_data, mutation, body_mode, eos)
+        response::response_body(body_data, None, body_mode, eos)
     };
     Ok(responses)
 }
@@ -387,19 +384,11 @@ impl OnceWarning {
 /// went out, so a filter that derives headers from the body is silently
 /// ineffective. Surface that so operators can switch the direction to
 /// `BUFFERED` or `FULL_DUPLEX_STREAMED`.
-fn warn_unapplied_header_mutations(
-    ctx: &HttpFilterContext<'_>,
-    is_request: bool,
-    original_response_headers: Option<&HashMap<String, String>>,
-) {
+fn warn_unapplied_header_mutations(is_request: bool, mutation: Option<&HeaderMutation>) {
     if !STREAMED_HEADER_MUTATIONS.pending() {
         return;
     }
-    let mutation = if is_request {
-        adapter::collect_request_header_mutations(ctx)
-    } else {
-        original_response_headers.and_then(|original| adapter::collect_response_header_mutations_diff(ctx, original))
-    };
+
     if let Some(mutation) = mutation
         && STREAMED_HEADER_MUTATIONS.first()
     {
@@ -426,11 +415,7 @@ pub(crate) enum MutationDelivery {
 
 impl MutationDelivery {
     /// Package mutation into responses per delivery strategy.
-    fn deliver_request(
-        self,
-        mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-        state: &mut StreamState,
-    ) -> Vec<ProcessingResponse> {
+    fn deliver_request(self, mutation: Option<HeaderMutation>, state: &mut StreamState) -> Vec<ProcessingResponse> {
         match self {
             Self::Send => vec![response::request_headers(mutation)],
             Self::DeferWithResponse => {
@@ -445,11 +430,7 @@ impl MutationDelivery {
     }
 
     /// Package mutation into responses per delivery strategy.
-    fn deliver_response(
-        self,
-        mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-        state: &mut StreamState,
-    ) -> Vec<ProcessingResponse> {
+    fn deliver_response(self, mutation: Option<HeaderMutation>, state: &mut StreamState) -> Vec<ProcessingResponse> {
         match self {
             Self::Send => vec![response::response_headers(mutation)],
             Self::DeferWithResponse => {
@@ -625,10 +606,7 @@ fn body_data_if_present(buf: &[u8]) -> Option<&[u8]> {
 /// Merge deferred header mutations with current mutations.
 ///
 /// When both are present, combines their `set_headers` and `remove_headers` vectors.
-fn merge_mutations(
-    deferred: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-    current: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+fn merge_mutations(deferred: Option<HeaderMutation>, current: Option<HeaderMutation>) -> Option<HeaderMutation> {
     match (deferred, current) {
         (None, None) => None,
         (Some(m), None) | (None, Some(m)) => Some(m),
@@ -653,9 +631,7 @@ mod tests {
     use crate::test_support::snapshot_counter;
 
     /// Read the `content-length` value from a header mutation, if present.
-    fn content_length_of(
-        mutation: &Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-    ) -> Option<String> {
+    fn content_length_of(mutation: &Option<HeaderMutation>) -> Option<String> {
         mutation.as_ref()?.set_headers.iter().find_map(|h| {
             let hv = h.header.as_ref()?;
             hv.key.eq_ignore_ascii_case("content-length").then(|| hv.value.clone())
@@ -1392,14 +1368,17 @@ mod tests {
         }
     }
 
-    /// A body-derived routing header (BBR) must reach Envoy under `STREAMED`.
+    /// A body-derived header set in the body phase must NOT be emitted under
+    /// `STREAMED`.
     ///
-    /// The mutation surfaces only in the body phase, so `process_streamed_body_chunk`
-    /// must collect it from the filter context and set `clear_route_cache` -- without
-    /// this, the routing header is dropped and Envoy 404s (the streamed e2e gap).
+    /// Envoy already forwarded the headers upstream, so a header mutation on a
+    /// body message is dropped and re-routing cannot happen; emitting it (with
+    /// `clear_route_cache`) would only promise a routing change that never
+    /// occurs. The chunk itself is still forwarded, and a once-per-process
+    /// warning is the operator's signal to switch to BUFFERED or full-duplex.
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "test sets up a pipeline, filter, and assertions")]
-    async fn streamed_request_body_collects_body_derived_header_and_clears_route_cache() {
+    async fn streamed_request_body_derived_header_mutations_are_not_emitted() {
         use praxis_filter::FilterRegistry;
         use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ProtoResponse;
 
@@ -1423,8 +1402,9 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
         state.protocol_config.request_body_mode = BodyMode::Streamed;
 
+        let payload = br#"{"model":"internal-model"}"#.to_vec();
         let body = praxis_proto::envoy::service::ext_proc::v3::HttpBody {
-            body: br#"{"model":"internal-model"}"#.to_vec(),
+            body: payload.clone(),
             end_of_stream: true,
         };
         let responses = process_streamed_body_chunk(&pipeline, body, &mut state, true)
@@ -1439,18 +1419,17 @@ mod tests {
             })
             .unwrap();
 
-        let mutation = common.header_mutation.as_ref().unwrap();
         assert!(
-            mutation
-                .set_headers
-                .iter()
-                .filter_map(|h| h.header.as_ref())
-                .any(|h| h.key == "x-gateway-model-name"),
-            "the routing header set in the body phase must be emitted to Envoy"
+            common.header_mutation.is_none(),
+            "Envoy ignores header mutations on STREAMED body responses, so none must be emitted"
         );
         assert!(
-            common.clear_route_cache,
-            "a request-phase body header mutation must clear the route cache so Envoy re-routes"
+            !common.clear_route_cache,
+            "no header mutation is emitted, so the route cache must not be cleared"
+        );
+        assert!(
+            common.body_mutation.is_some(),
+            "the body chunk itself must still be forwarded"
         );
     }
 }
