@@ -328,10 +328,11 @@ MODE             ?= fds
 E2E_KIND_CONTEXT ?= kind-praxis-e2e
 
 e2e-setup: images
+	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
 	$(FORGE_CMD) cluster create e2e
 	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
 	$(FORGE_CMD) stack apply e2e
-	kubectl --context $(E2E_KIND_CONTEXT) apply -k deploy/overlays/e2e/test/modes/$(MODE)
+	kubectl --context "$(E2E_KIND_CONTEXT)" apply -k "deploy/overlays/e2e/test/modes/$(MODE)"
 
 e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
