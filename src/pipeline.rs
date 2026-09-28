@@ -337,10 +337,6 @@ pub(crate) async fn process_streamed_body_chunk(
         state.protocol_config.response_body_mode
     };
 
-    // STREAMED forwards the chunk but never the body-derived header mutation:
-    // Envoy already sent the headers upstream, so it drops any mutation on a body
-    // message. The warning above is the operator's only signal; switch the
-    // direction to BUFFERED or full-duplex to apply body-derived headers.
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
         response::request_body(body_data, None, body_mode, eos)
