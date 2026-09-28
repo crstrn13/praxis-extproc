@@ -51,17 +51,19 @@ pub(crate) async fn run_request_pipeline(
         metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
     let original_len = state.request_body.len();
     let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
     if let Some(imm) = body_reject {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -110,7 +112,7 @@ pub(crate) async fn run_response_pipeline(
         Status::invalid_argument("response headers not received")
     })?;
 
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
@@ -126,6 +128,7 @@ pub(crate) async fn run_response_pipeline(
     )
     .await?
     {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(rejection)]);
     }
 
@@ -297,7 +300,7 @@ pub(crate) async fn process_streamed_body_chunk(
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
     })?;
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     // Resolve the fallible response ref before hydrate drains carried state, so an
     // early return here leaves the parked state untouched.
     if !is_request {
@@ -317,6 +320,7 @@ pub(crate) async fn process_streamed_body_chunk(
         run_resp_body_filters(pipeline, &mut ctx, &mut chunk, eos)?
     };
     if let Some(imm) = reject {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
     ctx.dehydrate(&mut state.carried_context)?;
@@ -402,11 +406,12 @@ pub(crate) async fn run_request_header_filters_early(
     let Some(request) = state.request.as_ref() else {
         return Ok(delivery.deliver_request(None, state));
     };
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -426,7 +431,7 @@ pub(crate) async fn run_response_header_filters_early(
         return Ok(delivery.deliver_response(None, state));
     };
 
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
     };
@@ -439,6 +444,7 @@ pub(crate) async fn run_response_header_filters_early(
 
     let action = execute_response(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
+        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -570,7 +576,7 @@ pub(crate) async fn flush_streamed_body_filters(
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
     })?;
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     // Resolve the fallible response ref before hydrate drains carried state, so an
     // early return here leaves the parked state untouched.
     if !is_request {
@@ -847,6 +853,80 @@ mod tests {
         crate::config::build_pipeline(&cfg, &registry).unwrap()
     }
 
+    /// Filter that rejects every request with an immediate response.
+    struct RejectFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RejectFilter {
+        fn name(&self) -> &'static str {
+            "always_reject"
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+        }
+
+        async fn on_response(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl RejectFilter {
+        /// Registry factory for `always_reject`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// A pipeline of just the `always_reject` filter.
+    fn reject_pipeline() -> Arc<FilterPipeline> {
+        use praxis_filter::FilterRegistry;
+
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: always_reject\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register("always_reject", praxis_filter::http_builtin(RejectFilter::from_config))
+            .unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// A reject in one phase must still restore the carried context, so a later
+    /// phase on the same [`StreamState`] hydrates cleanly instead of failing
+    /// with `cross-phase context missing`.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn reject_restores_carried_context_for_next_phase() {
+        let pipeline = reject_pipeline();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        let responses = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            .await
+            .expect("a reject must produce an immediate response, not an error");
+        assert_eq!(responses.len(), 1, "a reject yields exactly one immediate response");
+        assert!(
+            state.carried_context.is_some(),
+            "a reject must dehydrate carried_context, not leave the slot drained"
+        );
+
+        // The next phase on the same stream must hydrate without erroring.
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
+        assert!(
+            result.is_ok(),
+            "a phase after a reject must not fail with cross-phase context missing: {result:?}"
+        );
+    }
+
     /// Removes temporary files created by protocol integration tests even
     /// when an assertion fails before the normal cleanup path runs.
     struct TempFiles(Vec<std::path::PathBuf>);
@@ -950,7 +1030,7 @@ mod tests {
             header("authorization", "Bearer caller"),
             header("x-api-key", "caller-key"),
         ]);
-        let mut context = adapter::build_filter_context(&pipeline, &request);
+        let mut context = adapter::build_filter_context(&pipeline, &request, false);
         let _action = pipeline.execute_http_request(&mut context).await.unwrap();
         let mutation = adapter::collect_request_header_mutations(&context).expect("handoff must mutate headers");
 
@@ -1261,7 +1341,7 @@ mod tests {
 
         // Seed every carried field on a hydrated context, the way a filter would
         // (through DerefMut), so `hydrate` stays the only way to build one.
-        let ctx = adapter::build_filter_context(&pipeline, &request);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
         let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
         hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
         hydrated.executed_filter_indices = vec![true, false, true];
@@ -1290,7 +1370,7 @@ mod tests {
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
@@ -1309,7 +1389,7 @@ mod tests {
     fn hydrate_reports_missing_carried_context() {
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
 
         let result = HydratedContext::hydrate(None, fresh);
         assert!(
@@ -1329,12 +1409,12 @@ mod tests {
         let mut slot = Some(CarriedContext::default());
 
         // First hydrate drains the slot to None.
-        let first = adapter::build_filter_context(&pipeline, &request);
+        let first = adapter::build_filter_context(&pipeline, &request, false);
         let _hydrated = HydratedContext::hydrate(slot.take(), first).unwrap();
         assert!(slot.is_none(), "hydrate's take must leave the slot None");
 
         // Second hydrate finds None and must error instead of carrying empty state.
-        let second = adapter::build_filter_context(&pipeline, &request);
+        let second = adapter::build_filter_context(&pipeline, &request, false);
         let result = HydratedContext::hydrate(slot.take(), second);
         assert!(
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
@@ -1351,7 +1431,7 @@ mod tests {
 
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
 
         // The slot is still occupied: a prior phase failed to drain it.

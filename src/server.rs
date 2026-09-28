@@ -65,6 +65,9 @@ pub struct PraxisExtProc {
     force_shutdown: watch::Receiver<bool>,
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     max_body_accumulation: Option<usize>,
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    trust_forwarded_for: bool,
 }
 
 impl PraxisExtProc {
@@ -82,6 +85,7 @@ impl PraxisExtProc {
             pipeline,
             force_shutdown: rx,
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
+            trust_forwarded_for: false,
         }
     }
 
@@ -96,6 +100,17 @@ impl PraxisExtProc {
     #[must_use]
     pub fn with_max_body_accumulation(mut self, limit: Option<usize>) -> Self {
         self.max_body_accumulation = limit;
+        self
+    }
+
+    /// Trust `x-forwarded-for` for the client address when Envoy's trusted
+    /// `x-envoy-external-address` header is absent.
+    ///
+    /// Defaults to `false`; enable only when Envoy normalizes the header (e.g.
+    /// `use_remote_address`), otherwise the leftmost entry is client-spoofable.
+    #[must_use]
+    pub fn with_trust_forwarded_for(mut self, trust: bool) -> Self {
+        self.trust_forwarded_for = trust;
         self
     }
 }
@@ -129,12 +144,13 @@ impl ExternalProcessor for PraxisExtProc {
         let pipeline = Arc::clone(&self.pipeline);
         let force = self.force_shutdown.clone();
         let max_body = self.max_body_accumulation;
+        let trust_forwarded_for = self.trust_forwarded_for;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
             tokio::select! {
-                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body)) => {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for)) => {
                     if let Err(e) = r {
                         error!(error = %e, "stream processing failed");
                         drop(tx.send(Err(e)).await);
@@ -169,10 +185,12 @@ async fn handle_stream(
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     max_body: Option<usize>,
+    trust_forwarded_for: bool,
 ) -> Result<(), Status> {
     let start = Instant::now();
     let mut stream_state = StreamState::new();
     stream_state.max_body_accumulation = max_body;
+    stream_state.trust_forwarded_for = trust_forwarded_for;
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -470,6 +488,10 @@ pub(crate) struct StreamState {
 
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     pub(crate) max_body_accumulation: Option<usize>,
+
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    pub(crate) trust_forwarded_for: bool,
 }
 
 impl Default for StreamState {
@@ -490,6 +512,7 @@ impl Default for StreamState {
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
             max_body_accumulation: None,
+            trust_forwarded_for: false,
         }
     }
 }

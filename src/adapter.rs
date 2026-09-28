@@ -110,9 +110,11 @@ fn append_header(map: &mut HeaderMap, hv: &HeaderValue) {
 
 /// Build a minimal [`HttpFilterContext`] from a converted [`Request`].
 ///
-/// Populates `client_addr` from the `x-forwarded-for` header if present.
-/// All routing fields (`cluster`, `upstream`) default to `None`; they are
-/// advisory in ExtProc mode since Envoy owns routing.
+/// Populates `client_addr` from the trusted client-address headers; see
+/// [`extract_client_addr`] for how `trust_forwarded_for` gates the
+/// `x-forwarded-for` fallback. All routing fields (`cluster`, `upstream`)
+/// default to `None`; they are advisory in ExtProc mode since Envoy owns
+/// routing.
 ///
 /// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
 /// [`Request`]: praxis_filter::Request
@@ -120,8 +122,12 @@ fn append_header(map: &mut HeaderMap, hv: &HeaderValue) {
     clippy::too_many_lines,
     reason = "HttpFilterContext field init mirrors the struct; splitting obscures defaults"
 )]
-pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Request) -> HttpFilterContext<'a> {
-    let client_addr = extract_client_addr(request);
+pub fn build_filter_context<'a>(
+    pipeline: &'a FilterPipeline,
+    request: &'a Request,
+    trust_forwarded_for: bool,
+) -> HttpFilterContext<'a> {
+    let client_addr = extract_client_addr(request, trust_forwarded_for);
 
     HttpFilterContext {
         buffered_request_body: None,
@@ -408,12 +414,19 @@ fn header_value_str(hv: &HeaderValue) -> &str {
 
 /// Extract the client IP for `HttpFilterContext::client_addr`.
 ///
-/// Prefers `x-envoy-external-address`, which Envoy derives from its own
-/// trusted-hop configuration and sanitizes on external requests, over the
-/// first `x-forwarded-for` entry, which any client can set. The latter
-/// remains the fallback for deployments that do not use `use_remote_address`.
-fn extract_client_addr(request: &Request) -> Option<IpAddr> {
-    first_ip_in_header(request, "x-envoy-external-address").or_else(|| first_ip_in_header(request, "x-forwarded-for"))
+/// Uses `x-envoy-external-address`, which Envoy derives from its own
+/// trusted-hop configuration and sanitizes on external requests. When that
+/// header is absent and `trust_forwarded_for` is set, falls back to the first
+/// `x-forwarded-for` entry; that entry is client-supplied, so it is trusted
+/// only for deployments that normalize the header (e.g. `use_remote_address`).
+/// Otherwise the client address is left unset rather than trusting spoofable
+/// input.
+fn extract_client_addr(request: &Request, trust_forwarded_for: bool) -> Option<IpAddr> {
+    first_ip_in_header(request, "x-envoy-external-address").or_else(|| {
+        trust_forwarded_for
+            .then(|| first_ip_in_header(request, "x-forwarded-for"))
+            .flatten()
+    })
 }
 
 /// Parse the first comma-separated IP address in a header.
@@ -689,7 +702,7 @@ mod tests {
     #[test]
     fn build_context_defaults() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, false);
 
         assert!(ctx.client_addr.is_none(), "client_addr should be None without XFF");
         assert!(ctx.cluster.is_none(), "cluster should be None");
@@ -704,7 +717,7 @@ mod tests {
             make_header("x-forwarded-for", "10.0.0.1, 172.16.0.1"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, true);
 
         assert_eq!(
             ctx.client_addr,
@@ -721,7 +734,7 @@ mod tests {
             make_header("x-forwarded-for", "not-an-ip-address"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, true);
 
         assert!(
             ctx.client_addr.is_none(),
@@ -738,7 +751,7 @@ mod tests {
             make_header("x-envoy-external-address", "203.0.113.9"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, false);
 
         assert_eq!(
             ctx.client_addr,
@@ -756,7 +769,7 @@ mod tests {
             make_header("x-envoy-external-address", "not-an-ip"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, true);
 
         assert_eq!(
             ctx.client_addr,
@@ -766,9 +779,25 @@ mod tests {
     }
 
     #[test]
+    fn build_context_ignores_untrusted_xff() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-forwarded-for", "10.0.0.1, 172.16.0.1"),
+        ];
+        let req = envoy_headers_to_request(&headers);
+        let ctx = build_filter_context(test_pipeline(), &req, false);
+
+        assert!(
+            ctx.client_addr.is_none(),
+            "XFF must be ignored unless trust_forwarded_for is set: the leftmost entry is client-spoofable"
+        );
+    }
+
+    #[test]
     fn collect_mutations_empty_when_no_extras() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, false);
 
         assert!(
             collect_request_header_mutations(&ctx).is_none(),
@@ -779,7 +808,7 @@ mod tests {
     #[test]
     fn collect_mutations_from_extra_headers() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
         ctx.extra_request_headers.push(("x-added".into(), "value".to_owned()));
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -800,7 +829,7 @@ mod tests {
     #[test]
     fn collect_mutations_includes_rewritten_path() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/old")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
         ctx.rewritten_path = Some("/new/path".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -825,7 +854,7 @@ mod tests {
     #[test]
     fn collect_mutations_rewritten_path_only() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
         ctx.rewritten_path = Some("/rewritten".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -836,7 +865,7 @@ mod tests {
     #[test]
     fn collect_mutations_from_set_and_remove_headers() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
         ctx.request_headers_to_set.push((
             http::header::HeaderName::from_static("x-set"),
             http::header::HeaderValue::from_static("one"),
@@ -1016,7 +1045,7 @@ mod tests {
     #[test]
     fn response_diff_detects_added_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -1040,7 +1069,7 @@ mod tests {
     #[test]
     fn response_diff_detects_modified_value() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -1066,7 +1095,7 @@ mod tests {
     #[test]
     fn response_diff_detects_removed_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -1091,7 +1120,7 @@ mod tests {
     #[test]
     fn response_diff_unchanged_returns_none() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -1113,7 +1142,7 @@ mod tests {
     #[test]
     fn response_diff_leaves_unchanged_multi_valued_header_alone() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -1134,7 +1163,7 @@ mod tests {
     #[test]
     fn response_diff_reemits_changed_multi_valued_header_in_order() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut original = HeaderMap::new();
         original.append("set-cookie", "a=1".parse().unwrap());
@@ -1168,7 +1197,7 @@ mod tests {
     #[test]
     fn response_diff_dropping_one_of_several_values_overwrites_with_the_rest() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut original = HeaderMap::new();
         original.append("vary", "accept".parse().unwrap());
@@ -1197,7 +1226,7 @@ mod tests {
     #[test]
     fn response_diff_keeps_opaque_value_bytes() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, false);
 
         let mut resp = Response {
             status: StatusCode::OK,
