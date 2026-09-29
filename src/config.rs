@@ -93,10 +93,11 @@ pub struct ServerConfig {
     /// trusted `x-envoy-external-address` header is absent.
     ///
     /// Defaults to `false`: the leftmost `x-forwarded-for` entry is
-    /// client-supplied and spoofable, so it is only trusted when Envoy is known
-    /// to normalize the header (e.g. `use_remote_address`). When `false`, an
-    /// absent trusted header leaves the client address unset rather than
-    /// trusting attacker-controlled input.
+    /// client-supplied and spoofable. Enable it only behind a trusted ingress
+    /// that strips any client-supplied `x-forwarded-for` and writes the verified
+    /// client address as the header's sole entry; otherwise leave it disabled.
+    /// When `false`, an absent trusted header leaves the client address unset
+    /// rather than trusting attacker-controlled input.
     #[serde(default)]
     pub trust_forwarded_for: bool,
 }

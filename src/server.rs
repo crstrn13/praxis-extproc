@@ -107,8 +107,10 @@ impl PraxisExtProc {
     /// Trust `x-forwarded-for` for the client address when Envoy's trusted
     /// `x-envoy-external-address` header is absent.
     ///
-    /// Defaults to `false`; enable only when Envoy normalizes the header (e.g.
-    /// `use_remote_address`), otherwise the leftmost entry is client-spoofable.
+    /// Defaults to `false`; enable only behind a trusted ingress that strips
+    /// client-supplied `x-forwarded-for` and writes the verified client address
+    /// as the header's sole entry, otherwise the leftmost entry is
+    /// client-spoofable.
     #[must_use]
     pub fn with_trust_forwarded_for(mut self, trust: bool) -> Self {
         self.trust_forwarded_for = trust;

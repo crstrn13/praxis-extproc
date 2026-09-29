@@ -570,11 +570,7 @@ async fn run_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
-
-    Ok(None)
+    Ok(immediate_from_action(action))
 }
 
 /// Run response body filters (synchronous, per Pingora constraint).
@@ -597,11 +593,7 @@ fn run_resp_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
-
-    Ok(None)
+    Ok(immediate_from_action(action))
 }
 
 // -----------------------------------------------------------------------------
@@ -614,8 +606,8 @@ fn run_resp_body_filters(
 /// Every chunk was answered as it arrived but none carried `end_of_stream`, so
 /// filters that finish at end of stream (access logging, token accounting) would
 /// otherwise never run it. Run the body filters once more with no data and the
-/// flag set; any body bytes they produce have no message to ride on, but a
-/// rejection still applies.
+/// flag set; a reject or terminal response still applies, while bytes that no
+/// trailers ack can carry fail the stream (see [`run_trailing_body`]).
 pub(crate) async fn flush_streamed_body_filters(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -645,8 +637,13 @@ pub(crate) async fn flush_streamed_body_filters(
         .collect())
 }
 
-/// Run body filters once with `end_of_stream` set and no data, warning if they
-/// emit bytes that no message can carry.
+/// Run body filters once with `end_of_stream` set and no data.
+///
+/// Bytes produced here can only ride a body message, but trailers already closed
+/// the body: the next message is the trailers ack, which carries no body. An
+/// immediate action (reject or terminal response) supersedes the body, so any
+/// leftover bytes are moot then. Otherwise dropping them would silently truncate
+/// the payload, so fail the stream instead.
 async fn run_trailing_body(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
@@ -660,11 +657,13 @@ async fn run_trailing_body(
     }
     .map_err(|e| Status::internal(e.to_string()))?;
 
-    if body.as_ref().is_some_and(|b| !b.is_empty()) {
-        warn!(
-            direction = direction_label(is_request),
-            "body filters produced bytes at end of stream after trailers; no message can carry them"
-        );
+    let is_immediate = matches!(action, FilterAction::Reject(_) | FilterAction::TerminalResponse(_));
+    if !is_immediate && body.as_ref().is_some_and(|b| !b.is_empty()) {
+        return Err(Status::internal(format!(
+            "{} body filters produced bytes at end of stream after trailers; \
+             no message can carry them without truncating the payload",
+            direction_label(is_request)
+        )));
     }
     Ok(action)
 }
@@ -968,6 +967,242 @@ mod tests {
         assert!(
             result.is_ok(),
             "a phase after a reject must not fail with cross-phase context missing: {result:?}"
+        );
+    }
+
+    /// Filter that rejects from its body hooks.
+    struct RejectBodyFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RejectBodyFilter {
+        fn name(&self) -> &'static str {
+            "reject_body"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+        }
+
+        fn on_response_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+        }
+    }
+    impl RejectBodyFilter {
+        /// Registry factory for `reject_body`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Filter that emits body bytes at end of stream.
+    struct TrailingByteFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for TrailingByteFilter {
+        fn name(&self) -> &'static str {
+            "trailing_bytes"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if end_of_stream {
+                *body = Some(Bytes::from_static(b"late"));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl TrailingByteFilter {
+        /// Registry factory for `trailing_bytes`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Registry factory signature for the single-filter test pipelines.
+    type FilterFactoryFn =
+        fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>;
+
+    /// Build a single-filter pipeline from a registry factory.
+    fn single_filter_pipeline(name: &'static str, factory: FilterFactoryFn) -> Arc<FilterPipeline> {
+        use praxis_filter::FilterRegistry;
+
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(&format!(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: {name}\n"
+        ))
+        .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry.register(name, praxis_filter::http_builtin(factory)).unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// A reject from a request-body filter must short-circuit with an immediate
+    /// response and record the immediate-response metric, matching the header
+    /// paths (both now route through `immediate_from_action`).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn request_body_reject_short_circuits_and_records_metric() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = b"payload".to_vec();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let responses = {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+                .await
+                .expect("a body reject must produce an immediate response, not an error")
+        };
+        assert_eq!(
+            responses.len(),
+            1,
+            "a body reject yields exactly one immediate response"
+        );
+        assert!(
+            responses.first().is_some_and(response::is_immediate),
+            "a body-filter reject must be delivered as an immediate response"
+        );
+        assert_eq!(
+            snapshot_counter(&snapshotter, "praxis_extproc_immediate_responses_total", &[]),
+            1,
+            "a body-filter reject must record the immediate-response metric like the header paths"
+        );
+    }
+
+    /// A reject from a response-body filter must short-circuit too.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn response_body_reject_short_circuits() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        state.response_body = b"payload".to_vec();
+
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+            .await
+            .expect("a body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "a body-filter reject must be delivered as an immediate response"
+        );
+    }
+
+    /// When trailers close a streamed body and a filter emits bytes at end of
+    /// stream, no ExtProc message can carry them; the flush must fail loud rather
+    /// than silently truncate the payload.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn trailing_body_bytes_without_carrier_error() {
+        let pipeline = single_filter_pipeline("trailing_bytes", TrailingByteFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Run the headers phase first so the filter is marked executed and its
+        // context carries into the trailer-close flush.
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            .await
+            .expect("headers phase must succeed");
+
+        let result = flush_streamed_body_filters(&pipeline, &mut state, true).await;
+        assert!(
+            result.is_err(),
+            "undeliverable end-of-stream bytes after trailers must fail the stream, not be dropped: {result:?}"
+        );
+    }
+
+    /// A multi-valued response header no filter touched must not read as a
+    /// mutation. Snapshotting through a map that folds duplicate names
+    /// (last-one-wins) would drop entries and make an untouched `Set-Cookie`
+    /// look changed, forcing a spurious re-emit and route re-evaluation.
+    #[test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    fn capture_preserves_multivalued_headers_no_spurious_mutation() {
+        use praxis_filter::FilterRegistry;
+
+        let mut resp = Response {
+            status: http::StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.append(
+            http::header::SET_COOKIE,
+            "session=a".parse().expect("valid header value"),
+        );
+        resp.headers
+            .append(http::header::SET_COOKIE, "theme=b".parse().expect("valid header value"));
+
+        // Snapshot exactly as the response phase does, before any filter runs.
+        let original = capture_original_headers(&resp);
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline");
+        let request = adapter::envoy_headers_to_request(&[]);
+        let mut ctx = adapter::build_filter_context(&pipeline, &request, false);
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original);
+
+        assert!(
+            mutation.is_none(),
+            "an untouched multi-valued Set-Cookie must yield no mutation, but got: {mutation:?}"
         );
     }
 

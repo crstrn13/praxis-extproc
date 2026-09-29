@@ -430,9 +430,9 @@ fn header_value_str(hv: &HeaderValue) -> &str {
 /// trusted-hop configuration and sanitizes on external requests. When that
 /// header is absent and `trust_forwarded_for` is set, falls back to the first
 /// `x-forwarded-for` entry; that entry is client-supplied, so it is trusted
-/// only for deployments that normalize the header (e.g. `use_remote_address`).
-/// Otherwise the client address is left unset rather than trusting spoofable
-/// input.
+/// only behind a trusted ingress that strips client-supplied `x-forwarded-for`
+/// and writes the verified client address as the header's sole entry. Otherwise
+/// the client address is left unset rather than trusting spoofable input.
 fn extract_client_addr(request: &Request, trust_forwarded_for: bool) -> Option<IpAddr> {
     first_ip_in_header(request, "x-envoy-external-address").or_else(|| {
         trust_forwarded_for
