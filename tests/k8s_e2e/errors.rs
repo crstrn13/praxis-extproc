@@ -57,6 +57,34 @@ async fn empty_messages_handled() {
 }
 
 #[tokio::test]
+async fn oversized_body_rejected() {
+    ensure_gateway_ready().await;
+    let client = http_client();
+    let url = format!("{}/v1/chat/completions", gateway_url());
+
+    // The IPP ext-proc caps request bodies at 1 MiB (server.max_body_bytes in
+    // the e2e overlay). A 2 MiB payload trips the cap; because IPP runs with
+    // failure_mode_allow: false, the ext-proc RESOURCE_EXHAUSTED status fails
+    // closed and Envoy answers the client with a 5xx.
+    let oversized = "x".repeat(2 * 1024 * 1024);
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": oversized}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(
+        resp.status().is_server_error(),
+        "a body exceeding the IPP cap must be rejected with a 5xx, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
 async fn local_reply_ahead_of_ipp_keeps_its_status() {
     ensure_gateway_ready().await;
     let url = format!("{}/v1/chat/completions", gateway_url());
