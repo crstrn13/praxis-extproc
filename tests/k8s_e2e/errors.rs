@@ -63,9 +63,12 @@ async fn oversized_body_rejected() {
     let url = format!("{}/v1/chat/completions", gateway_url());
 
     // The IPP ext-proc caps request bodies at 1 MiB (server.max_body_bytes in
-    // the e2e overlay). A 2 MiB payload trips the cap; because IPP runs with
-    // failure_mode_allow: false, the ext-proc RESOURCE_EXHAUSTED status fails
-    // closed and Envoy answers the client with a 5xx.
+    // the e2e overlay). A 2 MiB payload must be rejected, not forwarded. How the
+    // rejection surfaces depends on the body mode: under BUFFERED, Envoy buffers
+    // the body and answers with a 413 before ext-proc sees it all; under
+    // FULL_DUPLEX_STREAMED, Envoy streams it through and our check_body_limit
+    // trips, returning RESOURCE_EXHAUSTED which (failure_mode_allow: false) fails
+    // closed as a 5xx. Accept either — the contract is "oversized body rejected".
     let oversized = "x".repeat(2 * 1024 * 1024);
     let resp = client
         .post(&url)
@@ -77,10 +80,10 @@ async fn oversized_body_rejected() {
         .await
         .expect("request failed");
 
+    let status = resp.status();
     assert!(
-        resp.status().is_server_error(),
-        "a body exceeding the IPP cap must be rejected with a 5xx, got {}",
-        resp.status()
+        status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || status.is_server_error(),
+        "an oversized body must be rejected (413 when Envoy buffers it, 5xx when ext-proc trips its cap), got {status}"
     );
 }
 
