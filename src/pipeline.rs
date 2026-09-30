@@ -61,7 +61,7 @@ pub(crate) async fn run_request_pipeline(
     }
 
     let original_len = state.request_body.len();
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
+    let body_reject = run_request_body_filters_at_eos(phase, pipeline, &mut ctx, &mut state.request_body).await?;
     if let Some(imm) = body_reject {
         ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
@@ -177,8 +177,10 @@ async fn execute_response_pipeline_and_body_filters(
         }
     }
 
-    let body_reject = run_resp_body_filters(pipeline, ctx, response_body, true)?;
-    Ok(body_reject)
+    match phase {
+        ResponsePhase::Headers => Ok(None),
+        ResponsePhase::Body => run_resp_body_filters(pipeline, ctx, response_body, true),
+    }
 }
 
 /// Set `content-length` when the emitted body differs in size from the original.
@@ -548,6 +550,23 @@ fn immediate_from_action(
 // -----------------------------------------------------------------------------
 // Filters
 // -----------------------------------------------------------------------------
+
+/// Run request-body filters at end of stream, skipping the headers-only phase.
+///
+/// The headers phase is reached only for a headers-only request (headers carried
+/// `end_of_stream`), so there is no body to filter. The body phase always runs the
+/// hook, even for an empty buffer, so an end-of-stream rejection still fires.
+async fn run_request_body_filters_at_eos(
+    phase: RequestPhase,
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    request_body: &mut Vec<u8>,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    match phase {
+        RequestPhase::Headers => Ok(None),
+        RequestPhase::Body => run_body_filters(pipeline, ctx, request_body, true).await,
+    }
+}
 
 /// Run request body filters if the pipeline has body capabilities.
 async fn run_body_filters(
@@ -1106,7 +1125,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let responses = {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            run_request_pipeline(RequestPhase::Body, &pipeline, &mut state)
                 .await
                 .expect("a body reject must produce an immediate response, not an error")
         };
@@ -1136,7 +1155,7 @@ mod tests {
         state.response = Some(adapter::envoy_headers_to_response(&[]));
         state.response_body = b"payload".to_vec();
 
-        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state)
             .await
             .expect("a body reject must produce an immediate response, not an error");
         assert!(
@@ -1205,6 +1224,27 @@ mod tests {
         assert!(
             responses.iter().any(response::is_immediate),
             "an empty buffered response body must still trigger the body-filter rejection: {responses:?}"
+        );
+    }
+
+    /// A headers-only response (headers EOS=true, no body message, e.g. a local
+    /// reply) must not run body filters on the never-streamed body: doing so
+    /// would let a body filter reject or rewrite a response that has no body,
+    /// swallowing the headers-only reply.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn headers_only_response_does_not_run_body_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        // response_body left empty: the response is headers-only.
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+            .await
+            .expect("a headers-only response must pass through, not error");
+        assert!(
+            !responses.iter().any(response::is_immediate),
+            "a headers-only response must not trigger a body-filter rejection: {responses:?}"
         );
     }
 
