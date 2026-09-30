@@ -606,8 +606,9 @@ fn run_resp_body_filters(
 /// Every chunk was answered as it arrived but none carried `end_of_stream`, so
 /// filters that finish at end of stream (access logging, token accounting) would
 /// otherwise never run it. Run the body filters once more with no data and the
-/// flag set; a reject or terminal response still applies, while bytes that no
-/// trailers ack can carry fail the stream (see [`run_trailing_body`]).
+/// flag set; a reject or terminal response still applies, while body bytes
+/// produced here have no message to ride on and are dropped (see
+/// [`run_trailing_body`]).
 pub(crate) async fn flush_streamed_body_filters(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -641,9 +642,8 @@ pub(crate) async fn flush_streamed_body_filters(
 ///
 /// Bytes produced here can only ride a body message, but trailers already closed
 /// the body: the next message is the trailers ack, which carries no body. An
-/// immediate action (reject or terminal response) supersedes the body, so any
-/// leftover bytes are moot then. Otherwise dropping them would silently truncate
-/// the payload, so fail the stream instead.
+/// immediate action (reject or terminal response) supersedes the body; any other
+/// leftover bytes have no message to carry them and are dropped with a warning.
 async fn run_trailing_body(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
@@ -657,13 +657,11 @@ async fn run_trailing_body(
     }
     .map_err(|e| Status::internal(e.to_string()))?;
 
-    let is_immediate = matches!(action, FilterAction::Reject(_) | FilterAction::TerminalResponse(_));
-    if !is_immediate && body.as_ref().is_some_and(|b| !b.is_empty()) {
-        return Err(Status::internal(format!(
-            "{} body filters produced bytes at end of stream after trailers; \
-             no message can carry them without truncating the payload",
-            direction_label(is_request)
-        )));
+    if body.as_ref().is_some_and(|b| !b.is_empty()) {
+        warn!(
+            direction = direction_label(is_request),
+            "body filters produced bytes at end of stream after trailers; no message can carry them"
+        );
     }
     Ok(action)
 }
@@ -1148,11 +1146,11 @@ mod tests {
     }
 
     /// When trailers close a streamed body and a filter emits bytes at end of
-    /// stream, no ExtProc message can carry them; the flush must fail loud rather
-    /// than silently truncate the payload.
+    /// stream, no ExtProc message can carry them; the flush drops them with a
+    /// warning and acknowledges the trailers rather than emitting a response.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn trailing_body_bytes_without_carrier_error() {
+    async fn trailing_body_bytes_without_carrier_dropped() {
         let pipeline = single_filter_pipeline("trailing_bytes", TrailingByteFilter::from_config);
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
@@ -1163,10 +1161,12 @@ mod tests {
             .await
             .expect("headers phase must succeed");
 
-        let result = flush_streamed_body_filters(&pipeline, &mut state, true).await;
+        let responses = flush_streamed_body_filters(&pipeline, &mut state, true)
+            .await
+            .expect("undeliverable end-of-stream bytes are dropped, not an error");
         assert!(
-            result.is_err(),
-            "undeliverable end-of-stream bytes after trailers must fail the stream, not be dropped: {result:?}"
+            responses.is_empty(),
+            "dropped trailing bytes without a rejection yield no response: {responses:?}"
         );
     }
 
