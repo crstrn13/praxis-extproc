@@ -110,9 +110,9 @@ fn append_header(map: &mut HeaderMap, hv: &HeaderValue) {
 
 /// Build a minimal [`HttpFilterContext`] from a converted [`Request`].
 ///
-/// Populates `client_addr` from the trusted client-address headers; see
-/// [`extract_client_addr`] for how `trust_forwarded_for` gates the
-/// `x-forwarded-for` fallback. All routing fields (`cluster`, `upstream`)
+/// Populates `client_addr` from the trusted client-address headers, with
+/// `trust_forwarded_for` gating the `x-forwarded-for` fallback. All routing
+/// fields (`cluster`, `upstream`)
 /// default to `None`; they are advisory in ExtProc mode since Envoy owns
 /// routing.
 ///
