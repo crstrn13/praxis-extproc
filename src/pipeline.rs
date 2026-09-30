@@ -556,7 +556,7 @@ async fn run_body_filters(
     body_buf: &mut Vec<u8>,
     eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if body_buf.is_empty() {
+    if body_buf.is_empty() && !eos {
         return Ok(None);
     }
 
@@ -580,7 +580,7 @@ fn run_resp_body_filters(
     body_buf: &mut Vec<u8>,
     eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if body_buf.is_empty() {
+    if body_buf.is_empty() && !eos {
         return Ok(None);
     }
 
@@ -1167,6 +1167,44 @@ mod tests {
         assert!(
             responses.is_empty(),
             "dropped trailing bytes without a rejection yield no response: {responses:?}"
+        );
+    }
+
+    /// A body filter that rejects at end of stream must fire even when the
+    /// buffered body is empty (e.g. trailers closed it with no bytes); otherwise
+    /// skipping the empty-buffer EOS call silently drops the rejection.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn empty_buffered_request_body_still_runs_eos_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        // request_body left empty, as when trailers close a body with no bytes.
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state)
+            .await
+            .expect("an empty-body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "an empty buffered body must still trigger the body-filter rejection: {responses:?}"
+        );
+    }
+
+    /// Response-side mirror: an empty buffered response body must still give
+    /// response-body filters their end-of-stream call.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn empty_buffered_response_body_still_runs_eos_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        // response_body left empty.
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state)
+            .await
+            .expect("an empty-body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "an empty buffered response body must still trigger the body-filter rejection: {responses:?}"
         );
     }
 
