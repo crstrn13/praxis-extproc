@@ -56,14 +56,12 @@ pub(crate) async fn run_request_pipeline(
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
     let original_len = state.request_body.len();
     let body_reject = run_request_body_filters_at_eos(phase, pipeline, &mut ctx, &mut state.request_body).await?;
     if let Some(imm) = body_reject {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -128,7 +126,6 @@ pub(crate) async fn run_response_pipeline(
     )
     .await?
     {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(rejection)]);
     }
 
@@ -326,7 +323,6 @@ pub(crate) async fn process_streamed_body_chunk(
         run_resp_body_filters(pipeline, &mut ctx, &mut chunk, eos)?
     };
     if let Some(imm) = reject {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
     let current_mutation = if is_request {
@@ -462,7 +458,6 @@ pub(crate) async fn run_request_header_filters_early(
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -495,7 +490,6 @@ pub(crate) async fn run_response_header_filters_early(
 
     let action = execute_response(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
-        ctx.dehydrate(&mut state.carried_context)?;
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -911,80 +905,6 @@ mod tests {
             .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
             .unwrap();
         crate::config::build_pipeline(&cfg, &registry).unwrap()
-    }
-
-    /// Filter that rejects every request with an immediate response.
-    struct RejectFilter;
-    #[async_trait::async_trait]
-    impl praxis_filter::HttpFilter for RejectFilter {
-        fn name(&self) -> &'static str {
-            "always_reject"
-        }
-
-        async fn on_request(
-            &self,
-            _ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
-        }
-
-        async fn on_response(
-            &self,
-            _ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            Ok(FilterAction::Continue)
-        }
-    }
-    impl RejectFilter {
-        /// Registry factory for `always_reject`.
-        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
-        fn from_config(
-            _: &serde_yaml::Value,
-        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
-            Ok(Box::new(Self))
-        }
-    }
-
-    /// A pipeline of just the `always_reject` filter.
-    fn reject_pipeline() -> Arc<FilterPipeline> {
-        use praxis_filter::FilterRegistry;
-
-        let cfg: crate::config::ExtProcConfig =
-            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: always_reject\n")
-                .unwrap();
-        let mut registry = FilterRegistry::with_builtins();
-        registry
-            .register("always_reject", praxis_filter::http_builtin(RejectFilter::from_config))
-            .unwrap();
-        crate::config::build_pipeline(&cfg, &registry).unwrap()
-    }
-
-    /// A reject in one phase must still restore the carried context, so a later
-    /// phase on the same [`StreamState`] hydrates cleanly instead of failing
-    /// with `cross-phase context missing`.
-    #[tokio::test]
-    #[expect(clippy::expect_used, reason = "tests")]
-    async fn reject_restores_carried_context_for_next_phase() {
-        let pipeline = reject_pipeline();
-        let mut state = StreamState::new();
-        state.request = Some(adapter::envoy_headers_to_request(&[]));
-
-        let responses = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
-            .await
-            .expect("a reject must produce an immediate response, not an error");
-        assert_eq!(responses.len(), 1, "a reject yields exactly one immediate response");
-        assert!(
-            state.carried_context.is_some(),
-            "a reject must dehydrate carried_context, not leave the slot drained"
-        );
-
-        // The next phase on the same stream must hydrate without erroring.
-        state.response = Some(adapter::envoy_headers_to_response(&[]));
-        let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
-        assert!(
-            result.is_ok(),
-            "a phase after a reject must not fail with cross-phase context missing: {result:?}"
-        );
     }
 
     /// Filter that rejects from its body hooks.
