@@ -231,8 +231,11 @@ async fn accumulate_request_body(
 
 /// Handle response headers: run response filters and respond with mutations.
 ///
-/// For `BUFFERED`, runs filters early and defers mutations to body phase
-/// (Envoy honours `CommonResponse.header_mutation` on body responses).
+/// For `BUFFERED` with body filters, returns no mutations now and runs the full
+/// pipeline at body EOS (Envoy honours `CommonResponse.header_mutation` on the
+/// body response).
+/// For `BUFFERED` without body filters, runs filters early and defers mutations
+/// to the body response.
 /// For `NONE`, runs filters early and sends mutations immediately because no
 /// response body message is delivered.
 /// For `STREAMED`, runs filters early and sends mutations immediately
