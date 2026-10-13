@@ -204,14 +204,21 @@ async fn multi_turn_conversation() {
 async fn large_body_passthrough() {
     ensure_gateway_ready().await;
     let large_content = "x".repeat(100_000);
-    // Route to the in-cluster model, not the external provider: under BUFFERED,
-    // Envoy holds the whole response until the end, and the shared external
-    // backend cannot serve a 100 KB body promptly under the suite's concurrency
-    // (the connection resets before the full body arrives). The in-cluster sim
-    // handles it deterministically, so this exercises large-body passthrough
-    // without depending on an external service's throughput. The external path
-    // is covered by `direct::direct_external_*` and `routing::gpt4_routes_via_header`.
+    // Deterministic large-body passthrough on the in-cluster model: its throughput
+    // is predictable regardless of how much concurrent traffic the suite drives.
     let resp = chat_completion("granite-8b", &large_content).await;
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn large_body_passthrough_external() {
+    ensure_gateway_ready().await;
+    let large_content = "x".repeat(100_000);
+    // Keep a large-body case on the external route: the direct/routing tests only
+    // send short prompts, so this preserves large-body coverage end-to-end on the
+    // external provider path.
+    let resp = chat_completion("gpt-4", &large_content).await;
 
     assert_eq!(resp.status(), 200);
 }
