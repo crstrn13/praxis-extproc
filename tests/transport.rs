@@ -33,22 +33,22 @@
     reason = "integration test utilities and assertions; some support items serve only the Tier-2 binary"
 )]
 
-#[path = "archetype/support.rs"]
+#[path = "transport/support.rs"]
 mod support;
 
-#[path = "archetype/boundaries.rs"]
+#[path = "transport/boundaries.rs"]
 mod boundaries;
 
-#[path = "archetype/fds.rs"]
+#[path = "transport/fds.rs"]
 mod fds;
 
-#[path = "archetype/limits.rs"]
+#[path = "transport/limits.rs"]
 mod limits;
 
-#[path = "archetype/selection.rs"]
+#[path = "transport/selection.rs"]
 mod selection;
 
-#[path = "archetype/stream_rejection.rs"]
+#[path = "transport/stream_rejection.rs"]
 mod stream_rejection;
 
 use praxis_proto::envoy::service::ext_proc::v3::BodySendMode;
