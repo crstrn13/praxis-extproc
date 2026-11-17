@@ -263,6 +263,41 @@ pub(crate) fn request(prompt: &str, stream: bool) -> ProcessingRequest {
         end_of_stream: true,
     }))
 }
+/// Build a chat-completions *request* body of an exact byte length, carrying
+/// real inner text (multibyte UTF-8 and JSON escapes) instead of trailing
+/// whitespace padding.
+pub(crate) fn exact_size_request(target: usize) -> Vec<u8> {
+    exact_size_body(
+        target,
+        |content| json!({"model":"test","messages":[{"role":"user","content":content}],"stream":false}),
+    )
+}
+
+/// Build a chat-completions *response* body of an exact byte length, same idea.
+pub(crate) fn exact_size_response(target: usize) -> Vec<u8> {
+    exact_size_body(
+        target,
+        |content| json!({"choices":[{"message":{"role":"assistant","content":content}}]}),
+    )
+}
+
+/// Serialize `envelope(content)` to exactly `target` bytes. The seed carries the
+/// bytes worth exercising (2- and 3-byte UTF-8 scalars, an escaped quote, an
+/// escaped newline); ASCII padding then dials the serialized length to the
+/// target, since each padding byte serializes one-to-one.
+fn exact_size_body(target: usize, envelope: impl Fn(&str) -> Value) -> Vec<u8> {
+    const SEED: &str = "café ☕ \"q\"\n";
+    let base = serde_json::to_vec(&envelope(SEED)).unwrap().len();
+    assert!(
+        target >= base,
+        "target {target} is below the minimal envelope size {base}"
+    );
+    let content = format!("{SEED}{}", "a".repeat(target - base));
+    let bytes = serde_json::to_vec(&envelope(&content)).unwrap();
+    assert_eq!(bytes.len(), target, "exact-size payload must hit its byte target");
+    bytes
+}
+
 pub(crate) fn request_headers(
     protocol: ProtocolConfiguration,
     selected: (bool, bool),
