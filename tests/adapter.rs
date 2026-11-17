@@ -2657,6 +2657,84 @@ impl WireSelectedBodyFilter {
     }
 }
 
+/// Replacement body size for the encode-limit test: larger than the test's
+/// per-message encode cap, smaller than the default so other tests are unaffected.
+const INFLATED_BODY_BYTES: usize = 128 * 1024;
+
+/// Replaces the request body with a payload larger than the encode limit, so the
+/// server must try to encode an oversized outbound `ProcessingResponse`.
+struct InflatingBodyFilter;
+
+#[async_trait::async_trait]
+impl HttpFilter for InflatingBodyFilter {
+    fn name(&self) -> &'static str {
+        "inflating_body"
+    }
+
+    async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    async fn on_request_body(
+        &self,
+        _: &mut HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        *body = Some(bytes::Bytes::from(vec![b'A'; INFLATED_BODY_BYTES]));
+        Ok(FilterAction::Continue)
+    }
+}
+
+impl InflatingBodyFilter {
+    #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+    fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self))
+    }
+}
+
+const INFLATING_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: inflating_body
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+/// The server's outbound (encode) per-message cap must bound the response the
+/// same way the inbound (decode) cap bounds the request. A tiny request whose
+/// body a filter inflates past the cap must fail the stream, not ship an
+/// unbounded frame. Without `.max_encoding_message_size`, tonic's default leaves
+/// the outbound side unlimited and this stream would succeed.
+#[tokio::test]
+async fn grpc_max_encoding_rejects_oversized_outbound_response() {
+    const LIMIT: usize = 64 * 1024;
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "inflating_body",
+            praxis_filter::http_builtin(InflatingBodyFilter::from_config),
+        )
+        .expect("register inflating test filter");
+    let (mut client, _shutdown) = start_server_with_registry_and_max_recv(INFLATING_BODY_CONFIG, registry, LIMIT).await;
+
+    let err = send_full_request_result(&mut client, "POST", "/inflate", b"x")
+        .await
+        .expect_err("an outbound message over the encode limit must fail the stream");
+    let message = err.to_string().to_ascii_lowercase();
+    assert!(
+        ["too large", "message size", "length", "encode", "out of range", "outofrange", "resource_exhausted"]
+            .iter()
+            .any(|needle| message.contains(needle)),
+        "expected a gRPC encode-size error, got: {err}"
+    );
+}
+
 /// Envoy-routed requests need both body translation and the late path mutation.
 #[tokio::test]
 async fn envoy_routed_anthropic_request_translates_body_and_path() {
