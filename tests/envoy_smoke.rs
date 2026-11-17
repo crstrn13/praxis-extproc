@@ -28,11 +28,11 @@
     reason = "Tier-2 smoke harness reusing the shared Tier-1 support module"
 )]
 
-#[path = "transport/support.rs"]
+#[path = "guardrails_transport/support.rs"]
 mod support;
 
 use serde_json::json;
 use support::{Harness, NemoReply};
 
-#[path = "transport/envoy.rs"]
+#[path = "guardrails_transport/envoy.rs"]
 mod envoy;
