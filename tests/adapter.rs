@@ -2728,9 +2728,17 @@ async fn grpc_max_encoding_rejects_oversized_outbound_response() {
         .expect_err("an outbound message over the encode limit must fail the stream");
     let message = err.to_string().to_ascii_lowercase();
     assert!(
-        ["too large", "message size", "length", "encode", "out of range", "outofrange", "resource_exhausted"]
-            .iter()
-            .any(|needle| message.contains(needle)),
+        [
+            "too large",
+            "message size",
+            "length",
+            "encode",
+            "out of range",
+            "outofrange",
+            "resource_exhausted"
+        ]
+        .iter()
+        .any(|needle| message.contains(needle)),
         "expected a gRPC encode-size error, got: {err}"
     );
 }

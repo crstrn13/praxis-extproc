@@ -493,10 +493,12 @@ async fn bind_listener(addr: SocketAddr) -> crate::error::Result<tokio::net::Tcp
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use metrics_util::CompositeKey;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::{
+        CompositeKey,
+        debugging::{DebugValue, DebuggingRecorder},
+    };
 
     use super::*;
 
@@ -560,16 +562,20 @@ mod tests {
 
     /// Value of the counter named `name` carrying exactly `labels`, if present.
     fn counter(snapshot: &[(CompositeKey, DebugValue)], name: &str, labels: &[(&str, &str)]) -> Option<u64> {
-        let mut want: Vec<(String, String)> =
-            labels.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect();
+        let mut want: Vec<(String, String)> = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
         want.sort();
         snapshot.iter().find_map(|(composite, value)| {
             let key = composite.key();
             if key.name() != name {
                 return None;
             }
-            let mut have: Vec<(String, String)> =
-                key.labels().map(|label| (label.key().to_owned(), label.value().to_owned())).collect();
+            let mut have: Vec<(String, String)> = key
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect();
             have.sort();
             if have != want {
                 return None;
@@ -629,16 +635,28 @@ mod tests {
             record_local_reply(None);
         });
         assert_eq!(
-            counter(&snapshot, "praxis_extproc_local_replies_total", &[("status_class", "4xx")]),
+            counter(
+                &snapshot,
+                "praxis_extproc_local_replies_total",
+                &[("status_class", "4xx")]
+            ),
             Some(2),
             "both client-error replies land in the 4xx series"
         );
         assert_eq!(
-            counter(&snapshot, "praxis_extproc_local_replies_total", &[("status_class", "2xx")]),
+            counter(
+                &snapshot,
+                "praxis_extproc_local_replies_total",
+                &[("status_class", "2xx")]
+            ),
             Some(1)
         );
         assert_eq!(
-            counter(&snapshot, "praxis_extproc_local_replies_total", &[("status_class", "other")]),
+            counter(
+                &snapshot,
+                "praxis_extproc_local_replies_total",
+                &[("status_class", "other")]
+            ),
             Some(1),
             "a missing status falls into the other bucket"
         );
@@ -650,7 +668,10 @@ mod tests {
             record_immediate_response();
             record_request(0.25);
         });
-        assert_eq!(counter(&snapshot, "praxis_extproc_immediate_responses_total", &[]), Some(1));
+        assert_eq!(
+            counter(&snapshot, "praxis_extproc_immediate_responses_total", &[]),
+            Some(1)
+        );
         assert_eq!(counter(&snapshot, "praxis_extproc_requests_total", &[]), Some(1));
     }
 

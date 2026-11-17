@@ -69,8 +69,8 @@ impl Drop for AwaitingProvider {
 
 pub(crate) struct Harness {
     pub(crate) client: ExternalProcessorClient<Channel>,
-    // Read only by the Tier-2 `envoy_smoke` binary, which shares this module;
-    // dead in the Tier-1 binary (see its crate-level `dead_code` allow).
+    /// Read only by the Tier-2 `envoy_smoke` binary, which shares this module;
+    /// dead in the Tier-1 binary (see its crate-level `dead_code` allow).
     #[cfg(feature = "integration")]
     pub(crate) endpoint: String,
     pub(crate) pending_call: Arc<PendingCall>,
