@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Red Hat, Inc.
 
-//! In-process gRPC integration tests for the ExtProc server.
+//! Adapter / transport mechanics: the wire <-> `HttpFilterContext` <->
+//! `ProcessingResponse` path, plus gRPC framing limits, exercised with stub
+//! filters so the server machinery is tested independently of real filters.
 //!
 //! Starts a tonic server on a random port, sends `ProcessingRequest`
 //! messages via a tonic client, and verifies responses.

@@ -1,4 +1,19 @@
-//! Real AI guardrail contracts across the ExtProc transport and body modes.
+//! Tier 1 (primary): the direct gRPC driver. Drives the real filter pipeline
+//! through the real adapter with hand-crafted `ProcessingRequest` messages and
+//! asserts transport behavior, scoped to filter archetypes rather than features.
+//!
+//! Submodules group the archetypes by the transport dimension they stress; the
+//! representative filter today is guardrails input/output (plus the anthropic
+//! converter in the Tier-2 smoke binary). Coverage maps onto the archetype
+//! table in `.docs/testing-gaps-and-suite-scoping.md`:
+//! - `selection`   selection-header interpretation feeding buffer+hold/reject
+//! - `fds`         buffer+hold/reject under full-duplex streaming
+//! - `limits`      payload/body-cap transport invariants (A1 payloads)
+//! - `boundaries`  isolation, response limits, unsupported-stream termination
+//! - `stream_rejection`  late `ImmediateResponse` cannot retract released output
+//!
+//! Not yet represented (no filter exercises them here): `CONTINUE_AND_REPLACE`,
+//! clear-route-cache, mode-override, dynamic-metadata, mutate-streamed-tail.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,31 +28,28 @@
     clippy::missing_panics_doc,
     clippy::future_not_send,
     clippy::large_futures,
+    dead_code,
     missing_docs,
-    reason = "integration test utilities and assertions"
+    reason = "integration test utilities and assertions; some support items serve only the Tier-2 binary"
 )]
 
-#[path = "guardrails_transport/support.rs"]
+#[path = "archetype/support.rs"]
 mod support;
 
-#[path = "guardrails_transport/boundaries.rs"]
+#[path = "archetype/boundaries.rs"]
 mod boundaries;
 
-#[path = "guardrails_transport/fds.rs"]
+#[path = "archetype/fds.rs"]
 mod fds;
 
-#[path = "guardrails_transport/limits.rs"]
+#[path = "archetype/limits.rs"]
 mod limits;
 
-#[path = "guardrails_transport/selection.rs"]
+#[path = "archetype/selection.rs"]
 mod selection;
 
-#[path = "guardrails_transport/stream_rejection.rs"]
+#[path = "archetype/stream_rejection.rs"]
 mod stream_rejection;
-
-#[cfg(feature = "integration")]
-#[path = "guardrails_transport/envoy.rs"]
-mod envoy;
 
 use praxis_proto::envoy::service::ext_proc::v3::BodySendMode;
 use serde_json::json;

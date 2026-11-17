@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,6 +14,9 @@ use praxis_extproc::{
     config::{ExtProcConfig, build_pipeline},
     response_mode::ResponseModeSelector,
     server::PraxisExtProc,
+};
+use praxis_filter::{
+    BodyAccess, FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext, Rejection,
 };
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -65,6 +69,8 @@ impl Drop for AwaitingProvider {
 
 pub(crate) struct Harness {
     pub(crate) client: ExternalProcessorClient<Channel>,
+    // Read only by the Tier-2 `envoy_smoke` binary, which shares this module;
+    // dead in the Tier-1 binary (see its crate-level `dead_code` allow).
     #[cfg(feature = "integration")]
     pub(crate) endpoint: String,
     pub(crate) pending_call: Arc<PendingCall>,
@@ -406,6 +412,134 @@ async fn nemo_response(
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .unwrap())
+}
+
+/// First SSE chunk emitted by the late-rejection harness.
+pub(crate) const FIRST: &[u8] = b"data: first\n\n";
+
+/// An in-process ext-proc server whose single filter streams response chunks
+/// and rejects once a byte budget is exceeded, used to prove that an
+/// `ImmediateResponse` after some output was released still terminates cleanly.
+pub(crate) struct RejectingServer {
+    pub(crate) address: SocketAddr,
+    calls: Arc<Mutex<Vec<Vec<u8>>>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for RejectingServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl RejectingServer {
+    pub(crate) async fn new(accepted_bytes: usize) -> Self {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&calls);
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register(
+                "late_rejection",
+                FilterFactory::Http(Arc::new(move |_| {
+                    Ok(Box::new(LateRejection {
+                        accepted_bytes,
+                        calls: Arc::clone(&record),
+                    }))
+                })),
+            )
+            .unwrap();
+        let cfg: ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: late_rejection\n")
+                .unwrap();
+        let service = ExternalProcessorServer::new(PraxisExtProc::new(build_pipeline(&cfg, &registry).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        Self { address, calls, task }
+    }
+
+    pub(crate) fn calls(&self) -> Vec<Vec<u8>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) async fn session(&self, mode: BodySendMode) -> Session {
+        let mut client = Box::pin(ExternalProcessorClient::connect(format!("http://{}", self.address)))
+            .await
+            .unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        let responses = client
+            .process(ReceiverStream::new(receiver))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut session = Session { sender, responses };
+        let protocol = ProtocolConfiguration {
+            request_body_mode: BodySendMode::None.into(),
+            response_body_mode: mode.into(),
+            ..Default::default()
+        };
+        let headers = session.exchange(request_headers(protocol, (false, false), true)).await;
+        assert!(matches!(headers.response, Some(ResponseMessage::RequestHeaders(_))));
+        session.send(response_headers("text/event-stream")).await;
+        if mode != BodySendMode::FullDuplexStreamed {
+            assert!(matches!(
+                session.next().await.unwrap().response,
+                Some(ResponseMessage::ResponseHeaders(_))
+            ));
+        }
+        session
+    }
+}
+
+struct LateRejection {
+    accepted_bytes: usize,
+    calls: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl HttpFilter for LateRejection {
+    fn name(&self) -> &'static str {
+        "late_rejection"
+    }
+
+    async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn response_body_mode(&self) -> praxis_filter::BodyMode {
+        praxis_filter::BodyMode::Stream
+    }
+
+    fn on_response_body(
+        &self,
+        _: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        _: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let bytes = body.as_deref().unwrap_or_default();
+        if bytes.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+        let mut calls = self.calls.lock().unwrap();
+        let total = calls.iter().map(Vec::len).sum::<usize>() + bytes.len();
+        calls.push(bytes.to_vec());
+        drop(calls);
+        Ok(if total > self.accepted_bytes {
+            FilterAction::Reject(Rejection::status(403))
+        } else {
+            FilterAction::Continue
+        })
+    }
 }
 
 pub(crate) fn configuration(endpoint: &str, translation: bool, limit: usize) -> ExtProcConfig {
